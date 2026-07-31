@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { Camera } from '../src/render/camera';
+import { Camera, listCameras, scoreCamera } from '../src/render/camera';
 
 /**
  * `Camera` 嘅生命週期防護。
@@ -184,5 +184,121 @@ describe('Camera 生命週期', () => {
     const camera = new Camera(video as unknown as HTMLVideoElement, { onFrame: () => {} });
     await expect(camera.start()).rejects.toThrow();
     expect(calls).toBe(1);
+  });
+});
+
+describe('鏡頭揀選', () => {
+  it('超廣角同虛擬多鏡頭排喺主鏡後面', () => {
+    // iOS Safari 真實會出嘅 label
+    const main = scoreCamera('Back Camera');
+    const ultra = scoreCamera('Back Ultra Wide Camera');
+    const dual = scoreCamera('Back Dual Wide Camera');
+    const tele = scoreCamera('Back Telephoto Camera');
+    const front = scoreCamera('Front Camera');
+
+    // 主鏡要贏晒 —— 超廣角有桶形畸變兼主體太細，
+    // 而 Dual/Triple 係虛擬鏡頭，會喺掃描途中自己切換實體鏡頭
+    expect(main).toBeGreaterThan(ultra);
+    expect(main).toBeGreaterThan(dual);
+    expect(main).toBeGreaterThan(tele);
+    // 前置鏡頭根本影唔到對面部機
+    expect(front).toBeLessThan(0);
+    expect(main).toBeGreaterThan(front);
+  });
+
+  it('Android 冇資訊嘅 label 唔會被誤判成差鏡頭', () => {
+    // Android Chrome 通常係咁：完全冇線索
+    const a = scoreCamera('camera2 0, facing back');
+    const b = scoreCamera('camera2 1, facing front');
+    expect(a).toBeGreaterThan(b); // 至少分得到前後
+    expect(a).toBeGreaterThan(0); // 唔會因為冇資訊就當佢差
+  });
+
+  it('listCameras 只列 videoinput，而且最適合嗰個排頭', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          enumerateDevices: async () => [
+            { kind: 'audioinput', deviceId: 'mic', label: 'Microphone' },
+            { kind: 'videoinput', deviceId: 'ultra', label: 'Back Ultra Wide Camera' },
+            { kind: 'videoinput', deviceId: 'front', label: 'Front Camera' },
+            { kind: 'videoinput', deviceId: 'main', label: 'Back Camera' },
+          ],
+        },
+      },
+    });
+
+    const cameras = await listCameras();
+    expect(cameras.map((c) => c.deviceId)).toEqual(['main', 'ultra', 'front']);
+    expect(cameras[0]!.label).toBe('Back Camera');
+  });
+
+  it('冇 label（未攞權限）都唔會爆，會出佔位名', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          enumerateDevices: async () => [
+            { kind: 'videoinput', deviceId: 'a', label: '' },
+            { kind: 'videoinput', deviceId: 'b', label: '' },
+          ],
+        },
+      },
+    });
+    const cameras = await listCameras();
+    expect(cameras).toHaveLength(2);
+    expect(cameras[0]!.label).toMatch(/鏡頭 \d/);
+  });
+
+  it('指定 deviceId 要用 exact，而且唔可以再帶 facingMode', async () => {
+    // 用 ideal 嘅話瀏覽器可以照樣揀第二個鏡頭 —— 用戶明明揀咗主鏡
+    // 結果又係超廣角，仲衰過冇得揀
+    const attempts: MediaTrackConstraints[] = [];
+    const track = { stop: () => {}, getSettings: () => ({ deviceId: 'main' }) };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          getUserMedia: async (c: MediaStreamConstraints) => {
+            attempts.push(c.video as MediaTrackConstraints);
+            return { getTracks: () => [track], getVideoTracks: () => [track] };
+          },
+        },
+      },
+    });
+
+    const video = new LeakyVideo();
+    const camera = new Camera(video as unknown as HTMLVideoElement, { onFrame: () => {} });
+    await camera.start('main');
+
+    const first = attempts[0]!;
+    expect((first.deviceId as ConstrainDOMStringParameters).exact).toBe('main');
+    expect(first.facingMode).toBeUndefined();
+    expect(camera.activeDeviceId).toBe('main');
+    camera.stop();
+  });
+
+  it('冇指定 deviceId 就用 facingMode 交返畀瀏覽器揀', async () => {
+    const attempts: MediaTrackConstraints[] = [];
+    const track = { stop: () => {}, getSettings: () => ({}) };
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: {
+        mediaDevices: {
+          getUserMedia: async (c: MediaStreamConstraints) => {
+            attempts.push(c.video as MediaTrackConstraints);
+            return { getTracks: () => [track], getVideoTracks: () => [track] };
+          },
+        },
+      },
+    });
+
+    const video = new LeakyVideo();
+    const camera = new Camera(video as unknown as HTMLVideoElement, { onFrame: () => {} });
+    await camera.start();
+    expect((attempts[0]!.facingMode as ConstrainDOMStringParameters).ideal).toBe('environment');
+    expect(attempts[0]!.deviceId).toBeUndefined();
+    camera.stop();
   });
 });

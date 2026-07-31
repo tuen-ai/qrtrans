@@ -371,6 +371,33 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── 鏡頭選擇 ───────────────────────────────────────── */
+
+.camera-picker {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 10px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.camera-picker label {
+  color: var(--ink-dim);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.camera-picker select {
+  min-width: 0; /* 長 label 唔好谷爆個 grid */
+}
+
+.camera-picker small {
+  grid-column: 2;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
 /* ── 相機 ───────────────────────────────────────────── */
 
 .camera-stage {

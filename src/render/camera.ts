@@ -29,6 +29,71 @@ export interface CameraOptions {
   onFrame(now: number): void;
 }
 
+export interface CameraOption {
+  deviceId: string;
+  /** 瀏覽器畀嘅名。未攞權限之前係空字串 */
+  label: string;
+  /** 適合掃 QR 嘅程度，愈大愈好（見 `scoreCamera`） */
+  score: number;
+}
+
+/**
+ * 幫每個鏡頭評分，愈大愈適合掃 QR。
+ *
+ * **點解要揀鏡頭：** `facingMode: 'environment'` 由瀏覽器決定用邊個後置
+ * 鏡頭，而多鏡頭手機好多時會揀「超廣角」。超廣角對掃 QR 係最差嘅選擇：
+ * 桶形畸變會扭曲模組網格，而且同樣距離之下主體佔嘅像素少一截 ——
+ * 直接撞穿「每模組 3 個像素」條底線。
+ *
+ * 仲有一個更隱蔽嘅：iOS 嘅「Dual / Triple Camera」係一個**虛擬**鏡頭，
+ * 會按距離自己切換實體鏡頭。掃到一半突然由主鏡跳去超廣角，解碼率會
+ * 無端端插水，而且睇落好似「靠近咗反而掃唔到」。
+ *
+ * iOS Safari 嘅 label 好清楚（"Back Camera" / "Back Ultra Wide Camera"），
+ * 所以呢個評分喺 iPhone 上好準。Android Chrome 多數係
+ * "camera2 0, facing back" 咁樣冇資訊，評分幫唔到手 —— 嗰陣就靠
+ * 「後置嘅第一個」，通常就係主鏡。
+ */
+export function scoreCamera(label: string): number {
+  const l = label.toLowerCase();
+  let score = 0;
+
+  // 後置優先（前置自拍鏡頭掃唔到對面部機）
+  if (/back|rear|environment|後置|后置/.test(l)) score += 100;
+  if (/front|face|user|前置/.test(l)) score -= 100;
+
+  // 超廣角：畸變 + 主體太細，最差
+  if (/ultra.?wide|超廣角|超广角|廣角|广角/.test(l)) score -= 60;
+  // 虛擬多鏡頭：會喺掃描途中自己切換鏡頭
+  if (/dual|triple|virtual/.test(l)) score -= 25;
+  // 長焦：遠距離掃反而好，但近距離對唔到焦
+  if (/telephoto|長焦|长焦/.test(l)) score += 5;
+  // 乾淨嘅「後置鏡頭」通常就係主鏡
+  if (/^back camera$|^rear camera$/.test(l.trim())) score += 30;
+
+  return score;
+}
+
+/**
+ * 列出所有可用鏡頭，最適合掃 QR 嗰個排頭。
+ *
+ * **一定要喺攞到權限之後先叫。** 未授權之前 `enumerateDevices()` 雖然
+ * 會列到裝置，但 `label` 全部係空字串（防指紋追蹤），咁就評唔到分、
+ * 用戶亦都揀唔到。
+ */
+export async function listCameras(): Promise<CameraOption[]> {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  return devices
+    .filter((d) => d.kind === 'videoinput')
+    .map((d, i) => ({
+      deviceId: d.deviceId,
+      label: d.label || `鏡頭 ${i + 1}`,
+      score: scoreCamera(d.label),
+    }))
+    .sort((a, b) => b.score - a.score);
+}
+
 export class Camera {
   private stream: MediaStream | null = null;
   private handle: number | null = null;
@@ -61,13 +126,24 @@ export class Camera {
     return this.stream?.getVideoTracks()[0]?.getSettings() ?? null;
   }
 
-  async start(): Promise<void> {
+  /** 而家用緊邊個鏡頭（deviceId）。 */
+  get activeDeviceId(): string | null {
+    return this.stream?.getVideoTracks()[0]?.getSettings().deviceId ?? null;
+  }
+
+  /**
+   * 開鏡頭。
+   *
+   * 畀咗 `deviceId` 就用嗰個實體鏡頭；冇就交返畀瀏覽器用 `facingMode`
+   * 揀（多鏡頭手機好多時會揀到超廣角，所以 UI 會鼓勵用戶自己揀）。
+   */
+  async start(deviceId?: string): Promise<void> {
     if (this.running) return;
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error('呢個瀏覽器唔支援相機（getUserMedia）。需要 HTTPS 同一個正常瀏覽器。');
     }
 
-    this.stream = await this.openBestStream();
+    this.stream = await this.openBestStream(deviceId);
 
     this.video.srcObject = this.stream;
     this.video.setAttribute('playsinline', ''); // iOS：唔好自動全螢幕播
@@ -90,24 +166,29 @@ export class Camera {
    * 60fps 通常喺 1280 闊度先取得到（1920 + 60fps 好多鏡頭做唔到），
    * 所以順序係：先保幀率，再保解像度。
    */
-  private async openBestStream(): Promise<MediaStream> {
-    const facing = { ideal: 'environment' as const };
+  private async openBestStream(deviceId?: string): Promise<MediaStream> {
+    // 指定咗鏡頭就用 `exact` —— 用 `ideal` 嘅話瀏覽器可以照樣揀第二個，
+    // 用戶明明揀咗主鏡結果又係超廣角，仲衰過冇得揀
+    const pick: MediaTrackConstraints = deviceId
+      ? { deviceId: { exact: deviceId } }
+      : { facingMode: { ideal: 'environment' } };
+
     const ladder: Array<{ label: string; video: MediaTrackConstraints }> = [
       {
         label: '1920×1080 @ 60fps（exact）',
-        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { exact: 60 } },
+        video: { ...pick, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { exact: 60 } },
       },
       {
         label: '1280×720 @ 60fps（exact）',
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { exact: 60 } },
+        video: { ...pick, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { exact: 60 } },
       },
       {
         label: '1920×1080 @ 60fps（ideal）',
-        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
+        video: { ...pick, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60 } },
       },
       {
         label: '預設',
-        video: { facingMode: facing },
+        video: { ...pick },
       },
     ];
 

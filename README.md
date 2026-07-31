@@ -83,6 +83,22 @@ Service worker 亦都受同一套約束：佢係整個 app 入面唯一可以攔
 其他貼士：螢幕亮度較高、熄咗自動亮度；維持成個 QR 連白邊都喺鏡頭畫面入面。
 兩邊都會自動申請 Wake Lock，唔使驚傳到一半熄屏。
 
+### 揀鏡頭（多鏡頭手機好重要）
+
+接收端開咗鏡頭之後，上面會有個鏡頭選擇器。**唔好用超廣角。**
+
+`facingMode: 'environment'` 係由瀏覽器決定用邊個後置鏡頭，而多鏡頭手機
+好多時會揀超廣角 —— 桶形畸變會扭曲模組網格，而且同樣距離下主體佔嘅像素
+少一截，直接撞穿「每模組 3 像素」條底線。
+
+仲有一個更隱蔽嘅：iOS 嘅「Dual / Triple Camera」係**虛擬**鏡頭，會按距離
+自己切換實體鏡頭。掃到一半突然由主鏡跳去超廣角，解碼率會無端端插水，
+而且睇落好似「靠近咗反而掃唔到」。
+
+所以選擇器會幫每個鏡頭評分，最適合嗰個排頭，唔建議嗰啲會標明。
+揀咗會記住，下次自動用返。**換鏡頭唔會丟失已收到嘅進度** —— 收到嘅
+block 同用邊個鏡頭無關，可以掃到一半先換。
+
 ---
 
 ## 佢點解快得起嚟
@@ -152,6 +168,8 @@ fountain code 免費吸收嘅嘢。
 - **進度條數收到幾多幀，唔數解咗幾多 block** —— LT peeling 係後置爆發嘅，實測收到 75% 需要嘅幀先解出 1.9% block。用 block 數就會由頭到尾釘死喺 0% 再彈到 100%
 - **iOS 相機要 `frameRate: {exact}`** —— 用 `ideal` 佢會靜靜雞畀返 30fps 而且唔報錯
 - **rVFC 要 generation counter** —— 已排隊嘅 callback 會活過 `stop()` 並喺下一條 stream 復活，變成兩條 capture loop
+- **列鏡頭一定要喺攞到權限之後** —— 未授權嘅話 `enumerateDevices()` 嘅 label 全部係空字串（防指紋追蹤），用戶就會見到一堆「鏡頭 1 / 鏡頭 2」揀唔落手
+- **指定鏡頭要用 `deviceId: {exact}`** —— 用 `ideal` 嘅話瀏覽器可以照樣揀第二個，用戶明明揀咗主鏡結果又係超廣角
 
 ---
 
@@ -187,7 +205,7 @@ src/
 
 ### 測試
 
-89 個測試：
+96 個測試：
 
 | 檔案 | 測乜 |
 |---|---|
@@ -195,9 +213,9 @@ src/
 | `lt.test.ts` | LT 端到端：掉包 0–50%、亂序到達、隨機模糊測試、overhead 迴歸門檻 |
 | `qr-roundtrip.test.ts` | 任意二進位 → QR → zxing → 一模一樣。滿載、全 0x00/0xFF、高位 byte、容量邊界、確認冇 ECI |
 | `loopback.test.ts` | 真 File → gzip → fountain → QR 圖 → zxing → LT → gunzip → SHA-256，喺 25/30/50% 掉幀率下 |
-| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋；**2×2 多碼並排端到端**；**斷網之後重載 app 兼真係播到 QR** |
+| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋；**2×2 多碼並排端到端**；**換鏡頭唔會丟失進度**；**斷網之後重載 app 兼真係播到 QR** |
 | `progress.test.ts` | 證明進度條真係線性推進、單調不減、完成一定到 100% |
-| `camera.test.ts` | 用「故意唔理會 cancel」嘅假 video 測 rVFC 殭屍迴圈防護；相機約束階梯 |
+| `camera.test.ts` | 用「故意唔理會 cancel」嘅假 video 測 rVFC 殭屍迴圈防護；相機約束階梯；鏡頭評分同列舉 |
 | `encode-perf.test.ts` | QR 編碼速度迴歸門檻（防止有人改返去自動揀 mask） |
 | `privacy.test.ts` | 私隱防線：唔准有外送 API、外部網域、CDN 殘留；CSP 內容；service worker 只准同源 |
 | `pwa.test.ts` | manifest 欄位、圖示齊全、sw.js 檔名穩定、precache 涵蓋 worker 同 wasm、註冊碼真係喺產物入面 |

@@ -1,4 +1,4 @@
-import { Camera } from '../render/camera';
+import { Camera, listCameras, type CameraOption } from '../render/camera';
 import { ScreenWakeLock } from '../render/wake-lock';
 import { decodeFrame, type Manifest, type StreamInfo } from '../protocol/frame';
 import { LtDecoder, expectedPackets } from '../protocol/lt-decoder';
@@ -25,6 +25,8 @@ const ROI_UNLOCK_MISSES = 15;
 const MAX_DECODE_DIM = 1280;
 /** 見到幾多次陌生 session 嘅 manifest 先當發送端換咗檔案 */
 const SESSION_SWITCH_THRESHOLD = 3;
+/** 記住用戶揀咗邊個鏡頭，下次唔使再揀 */
+const CAMERA_PREF_KEY = 'qrtrans.camera-device-id';
 
 const STAT_KEYS = [
   'CAPTURE FPS',
@@ -68,6 +70,9 @@ export class ReceiverView {
   private readonly downloadBtn: HTMLButtonElement;
   private readonly errorEl: HTMLElement;
   private readonly video: HTMLVideoElement;
+  private readonly cameraPicker: HTMLElement;
+  private readonly cameraSelect: HTMLSelectElement;
+  private readonly cameraHint: HTMLElement;
   private readonly roiBox: HTMLElement;
   private readonly stage: HTMLElement;
   private readonly progressBar: HTMLElement;
@@ -119,6 +124,9 @@ export class ReceiverView {
     this.downloadBtn = must(root, '#recv-download');
     this.errorEl = must(root, '#recv-error');
     this.video = must(root, '#camera-video');
+    this.cameraPicker = must(root, '#camera-picker');
+    this.cameraSelect = must(root, '#camera-select');
+    this.cameraHint = must(root, '#camera-hint');
     this.roiBox = must(root, '#roi-box');
     this.stage = must(root, '.camera-stage');
     this.progressBar = must(root, '#recv-progress');
@@ -133,6 +141,7 @@ export class ReceiverView {
     this.stopBtn.addEventListener('click', () => this.stop());
     this.againBtn.addEventListener('click', () => void this.restart());
     this.downloadBtn.addEventListener('click', () => this.download());
+    this.cameraSelect.addEventListener('change', () => void this.switchCamera(this.cameraSelect.value));
   }
 
   // ── 生命週期 ──────────────────────────────────────────
@@ -145,7 +154,7 @@ export class ReceiverView {
     try {
       this.resetSession();
       this.spawnPool();
-      await this.camera.start();
+      await this.camera.start(preferredCameraId() ?? undefined);
       void this.wakeLock.request();
     } catch (err) {
       this.teardown();
@@ -163,9 +172,11 @@ export class ReceiverView {
     const s = this.camera.settings;
     if (s?.width && s.height) {
       this.stats.set('CAPTURE FPS', '—');
-      this.progressLabel.textContent = `鏡頭 ${s.width}×${s.height}${s.frameRate ? ` @ ${Math.round(s.frameRate)}fps` : ''} · 等緊 manifest…`;
+      this.progressLabel.textContent = `鏡頭 ${s.width}×${s.height}${s.frameRate ? ` @ ${Math.round(s.frameRate)}fps` : ''} · 搵緊 QR…`;
     }
     this.stats.start();
+    // 一定要喺攞到權限之後先列鏡頭 —— 未授權嘅話 label 全部係空字串
+    void this.populateCameraPicker();
   }
 
   private async restart(): Promise<void> {
@@ -227,6 +238,83 @@ export class ReceiverView {
       };
       this.pool.push(pw);
     }
+  }
+
+  // ── 鏡頭選擇 ──────────────────────────────────────────
+
+  /**
+   * 列出可用鏡頭。**一定要喺 `getUserMedia` 成功之後先叫** —— 未授權
+   * 之前 `enumerateDevices()` 嘅 label 全部係空字串（瀏覽器防指紋追蹤），
+   * 用戶就會見到一堆「鏡頭 1 / 鏡頭 2」揀唔落手。
+   */
+  private async populateCameraPicker(): Promise<void> {
+    let cameras: CameraOption[] = [];
+    try {
+      cameras = await listCameras();
+    } catch {
+      // 列唔到就唔顯示選擇器，用預設鏡頭照掃
+    }
+    if (!this.running) return;
+
+    // 得一個鏡頭就冇得揀，唔好嘥位
+    if (cameras.length < 2) {
+      this.cameraPicker.hidden = true;
+      return;
+    }
+
+    const active = this.camera.activeDeviceId;
+    this.cameraSelect.replaceChildren(
+      ...cameras.map((cam) => {
+        const opt = document.createElement('option');
+        opt.value = cam.deviceId;
+        opt.textContent = cam.score < 0 ? `${cam.label}（唔建議）` : cam.label;
+        return opt;
+      }),
+    );
+    if (active && cameras.some((c) => c.deviceId === active)) {
+      this.cameraSelect.value = active;
+    }
+
+    const current = cameras.find((c) => c.deviceId === this.cameraSelect.value);
+    this.cameraHint.textContent =
+      current && current.score < 0
+        ? '⚠ 超廣角／多鏡頭虛擬鏡頭會令 QR 變形又縮細，掃唔到就換返主鏡頭。'
+        : '掃唔到就試下換另一個鏡頭 —— 超廣角唔適合掃 QR。';
+    this.cameraPicker.hidden = false;
+  }
+
+  /**
+   * 換鏡頭，但**保留已收到嘅進度**。
+   *
+   * LT 解碼器嘅狀態同用邊個鏡頭完全無關 —— 收到嘅 block 就係收到咗。
+   * 所以掃到一半發現用緊超廣角，換過主鏡繼續掃就得，唔使由頭嚟過。
+   * 但 ROI 要清 —— 換咗鏡頭之後視角同焦距都唔同，舊嗰個框已經冇意義。
+   */
+  private async switchCamera(deviceId: string): Promise<void> {
+    if (!this.running || !deviceId) return;
+    rememberCameraId(deviceId);
+
+    this.cameraSelect.disabled = true;
+    try {
+      this.camera.stop();
+      this.roi = null;
+      this.roiCells = 0;
+      this.roiBox.hidden = true;
+      this.missStreak = 0;
+      await this.camera.start(deviceId);
+    } catch (err) {
+      this.showError(`換鏡頭失敗：${this.explainCameraError(err)}`);
+      // 盡量返返去預設鏡頭，唔好留低一個死咗嘅畫面
+      try {
+        await this.camera.start();
+      } catch {
+        this.stop();
+        return;
+      }
+    } finally {
+      this.cameraSelect.disabled = false;
+    }
+    await this.populateCameraPicker();
   }
 
   // ── 取幀 → 解碼 ───────────────────────────────────────
@@ -580,6 +668,29 @@ export class ReceiverView {
 
   private hideError(): void {
     this.errorEl.hidden = true;
+  }
+}
+
+/**
+ * 記住／讀返用戶揀咗邊個鏡頭。
+ *
+ * deviceId 喺同一個 origin 之下係穩定嘅（清 cookie 或者重新授權會變），
+ * 所以記得住。萬一變咗，`start()` 嗰陣 `deviceId: {exact}` 會失敗，
+ * 我哋就會 fallback 返 facingMode。
+ */
+function preferredCameraId(): string | null {
+  try {
+    return localStorage.getItem(CAMERA_PREF_KEY);
+  } catch {
+    return null; // 私隱模式
+  }
+}
+
+function rememberCameraId(deviceId: string): void {
+  try {
+    localStorage.setItem(CAMERA_PREF_KEY, deviceId);
+  } catch {
+    // 記唔到就下次再揀，唔係大問題
   }
 }
 

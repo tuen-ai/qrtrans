@@ -445,6 +445,91 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
     }
   }, 240_000);
 
+  it('接收端：換鏡頭唔會丟失已收到嘅進度', async () => {
+    // LT 解碼器嘅狀態同用邊個鏡頭完全無關 —— 收到嘅 block 就係收到咗。
+    // 所以掃到一半發現用緊超廣角，換過主鏡應該可以繼續，唔使由頭嚟過。
+    const videoPath = join(workDir, 'switch.y4m');
+    const rng = new Prng(0x7331);
+    const payload = new Uint8Array(60_000); // 夠大，測試期間傳唔完
+    for (let i = 0; i < payload.length; i++) payload[i] = rng.nextInt(256);
+    await buildQrVideo(videoPath, payload);
+
+    const browser = await chromium.launch({
+      executablePath: chromiumPath,
+      args: [
+        '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
+        `--use-file-for-fake-video-capture=${videoPath}`,
+      ],
+    });
+    try {
+      const context = await browser.newContext({ permissions: ['camera'] });
+      const page = await context.newPage();
+      const pageErrors: string[] = [];
+      page.on('pageerror', (e) => pageErrors.push(String(e)));
+      await page.goto(`${base}#receive`, { waitUntil: 'networkidle' });
+
+      await page.click('#recv-start');
+      await page.waitForSelector('#recv-scanning:not([hidden])', { timeout: 20_000 });
+
+      // 全程每 150ms 抽一次「已解符號」。用連續取樣而唔係「換之前 / 換之後」
+      // 兩點比較 —— 兩點比較太鬆：就算進度被清零，幾秒之後個數又會爬返上去，
+      // 測試照樣過（我試過，加咗 resetSession() 都捉唔到）。
+      // 序列一旦有下跌，就代表狀態俾人清咗。
+      await page.evaluate(() => {
+        const w = window as unknown as { __samples: number[] };
+        w.__samples = [];
+        setInterval(() => {
+          const cell = [...document.querySelectorAll('#recv-stats .stat')].find(
+            (el) => el.querySelector('.stat-key')!.textContent === '已解符號',
+          );
+          w.__samples.push(Number(cell?.querySelector('.stat-val')?.textContent) || 0);
+        }, 150);
+      });
+
+      // 等到收咗一批先至換
+      await page.waitForFunction(
+        () => (window as unknown as { __samples: number[] }).__samples.some((v) => v > 15),
+        { timeout: 60_000 },
+      );
+
+      // 用假鏡頭得一個裝置，所以選擇器唔會顯示 —— 直接叫個切換路徑
+      const deviceId = await page.evaluate(async () => {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices.find((d) => d.kind === 'videoinput')?.deviceId ?? '';
+      });
+      expect(deviceId, '假鏡頭應該列得到').not.toBe('');
+
+      await page.evaluate((id) => {
+        const sel = document.querySelector<HTMLSelectElement>('#camera-select')!;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = 'fake';
+        sel.replaceChildren(opt);
+        sel.value = id;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }, deviceId);
+
+      await page.waitForTimeout(4000);
+      const samples = await page.evaluate(
+        () => (window as unknown as { __samples: number[] }).__samples,
+      );
+
+      // 全程單調不減 —— 任何下跌都代表換鏡頭清走咗解碼進度
+      const drop = samples.findIndex((v, i) => i > 0 && v < samples[i - 1]!);
+      expect(
+        drop,
+        `第 ${drop} 個取樣由 ${samples[drop - 1]} 跌到 ${samples[drop]} —— 換鏡頭清走咗進度`,
+      ).toBe(-1);
+      // 而且換完之後要繼續有新符號入嚟，唔係停咗
+      expect(samples.at(-1)!, '換鏡頭之後就冇再收到嘢').toBeGreaterThan(samples[0]!);
+
+      expect(pageErrors).toEqual([]);
+    } finally {
+      await browser.close();
+    }
+  }, 240_000);
+
   it('接收端：用假鏡頭餵一條 QR 影片，完整還原並驗到 SHA-256', async () => {
     const videoPath = join(workDir, 'qr.y4m');
     const rng = new Prng(0xcafe);
