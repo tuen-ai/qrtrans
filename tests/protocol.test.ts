@@ -250,24 +250,31 @@ describe('幀格式', () => {
     expect(out?.kind).toBe('manifest');
     if (out?.kind !== 'manifest') throw new Error('unreachable');
     expect(out.sessionId).toBe(0xbeef);
-    expect(out.manifest).toEqual(manifest);
+    // MANIFEST 唔再帶 blockSize —— 嗰個由 DATA 幀嘅長度推導
+    const { blockSize: _omitted, ...expected } = manifest;
+    expect(out.manifest).toEqual(expected);
   });
 
   it('DATA 編完再解一模一樣', () => {
     const block = new Uint8Array(2940).map((_, i) => (i * 31) & 0xff);
-    const frame = encodeDataFrame(0x1234, 0xdeadbeef, block);
+    const stream = { blockCount: 42, payloadSize: 42 * 2940 - 100 };
+    const frame = encodeDataFrame(0x1234, 0xdeadbeef, stream, block);
     expect(frame.length).toBe(DATA_FRAME_OVERHEAD + block.length);
     const out = decodeFrame(frame);
     expect(out?.kind).toBe('data');
     if (out?.kind !== 'data') throw new Error('unreachable');
     expect(out.sessionId).toBe(0x1234);
     expect(out.seed).toBe(0xdeadbeef);
+    expect(out.stream.blockCount).toBe(stream.blockCount);
+    expect(out.stream.payloadSize).toBe(stream.payloadSize);
+    // blockSize 唔喺表頭 —— 由幀長度推導返出嚟
+    expect(out.stream.blockSize).toBe(block.length);
     expect(out.payload).toEqual(block);
   });
 
   it('任何一個 bit 錯咗都要被 CRC 擋住', () => {
     const block = new Uint8Array(64).map((_, i) => i);
-    const frame = encodeDataFrame(1, 2, block);
+    const frame = encodeDataFrame(1, 2, { blockCount: 1, payloadSize: 64 }, block);
     for (let byteIdx = 0; byteIdx < frame.length; byteIdx++) {
       for (const bit of [0x01, 0x80]) {
         const bad = frame.slice();
@@ -278,7 +285,7 @@ describe('幀格式', () => {
   });
 
   it('壞 magic / 壞版本 / 太短 都回傳 null', () => {
-    const frame = encodeDataFrame(1, 2, new Uint8Array(32));
+    const frame = encodeDataFrame(1, 2, { blockCount: 1, payloadSize: 32 }, new Uint8Array(32));
     const badMagic = frame.slice();
     badMagic[0] = 0x50;
     expect(decodeFrame(badMagic)).toBeNull();
@@ -296,9 +303,13 @@ describe('幀格式', () => {
     expect(out.manifest.fileName).toBe('中'.repeat(85));
   });
 
-  it('不合理嘅 manifest 會被拒（防止配錯記憶體）', () => {
-    const frame = encodeManifestFrame(1, { ...manifest, blockCount: 1, blockSize: 10 });
-    // payloadSize(123456) > blockSize * blockCount(10) → 應該拒
-    expect(decodeFrame(frame)).toBeNull();
+  it('不合理嘅 DATA 幀會被拒（防止配錯記憶體）', () => {
+    const block = new Uint8Array(64);
+    // payloadSize 大過 blockCount × blockSize —— 唔可能
+    expect(decodeFrame(encodeDataFrame(1, 2, { blockCount: 1, payloadSize: 99999 }, block))).toBeNull();
+    // payloadSize 細到用少過 blockCount 個 block 就夠 —— 亦唔可能
+    expect(decodeFrame(encodeDataFrame(1, 2, { blockCount: 5, payloadSize: 64 }, block))).toBeNull();
+    // 啱啱好合理嘅就要收
+    expect(decodeFrame(encodeDataFrame(1, 2, { blockCount: 2, payloadSize: 100 }, block))).not.toBeNull();
   });
 });

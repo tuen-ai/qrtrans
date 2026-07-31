@@ -7,7 +7,13 @@ import { packFile } from '../src/codec/pack';
 import { unpackPayload } from '../src/codec/unpack';
 import { LtEncoder } from '../src/protocol/lt-encoder';
 import { LtDecoder } from '../src/protocol/lt-decoder';
-import { encodeManifestFrame, encodeDataFrame, decodeFrame, type Manifest } from '../src/protocol/frame';
+import {
+  encodeManifestFrame,
+  encodeDataFrame,
+  decodeFrame,
+  manifestPeriod,
+  type Manifest,
+} from '../src/protocol/frame';
 import { encodeQrMatrix, PROFILES, type QrProfile } from '../src/render/qr-encode';
 import { Prng } from '../src/protocol/prng';
 
@@ -110,10 +116,10 @@ async function loopback(
   profile: QrProfile,
   dropRate: number,
   channelSeed: number,
-  manifestPeriod = 12,
 ): Promise<LoopbackOutcome> {
   const packed = await packFile(file, profile.blockSize);
   const sessionId = 0x4242;
+  const period = manifestPeriod(packed.manifest.blockCount);
 
   const encoder = new LtEncoder(packed.payload, packed.manifest.blockSize);
   const manifestFrame = encodeManifestFrame(sessionId, packed.manifest);
@@ -126,15 +132,16 @@ async function loopback(
   let receivedManifest: Manifest | null = null;
   let framesSent = 0;
   let framesDecoded = 0;
+  let blockSize = 0;
 
   // 上限係一個安全網：正常應該遠遠早過呢個數就收齊
   const maxFrames = packed.manifest.blockCount * 8 + 200;
 
   while (framesSent < maxFrames) {
-    const isManifest = framesSent % manifestPeriod === 0;
+    const isManifest = framesSent % period === 0;
     const frame = isManifest
       ? manifestFrame
-      : encodeDataFrame(sessionId, encoder.next(scratch), scratch);
+      : encodeDataFrame(sessionId, encoder.next(scratch), packed.manifest, scratch);
     framesSent++;
 
     if (channel.nextInt(10_000) < dropRate * 10_000) continue; // 相機掉咗呢一幀
@@ -147,16 +154,21 @@ async function loopback(
     if (!parsed) continue;
 
     if (parsed.kind === 'manifest') {
-      if (!receivedManifest) {
-        receivedManifest = parsed.manifest;
-        decoder = new LtDecoder(parsed.manifest.blockCount, parsed.manifest.blockSize);
+      // v2：manifest 唔再開 decoder，佢只帶檔名／MIME／SHA-256
+      if (!receivedManifest && blockSize > 0) {
+        receivedManifest = { ...parsed.manifest, blockSize };
       }
       continue;
     }
 
-    if (!decoder || parsed.sessionId !== sessionId) continue;
+    if (parsed.sessionId !== sessionId) continue;
+    // v2：第一個 DATA 幀就開得到 decoder，唔使等 manifest
+    if (!decoder) {
+      blockSize = parsed.stream.blockSize;
+      decoder = new LtDecoder(parsed.stream.blockCount, blockSize);
+    }
     decoder.push(parsed.seed, parsed.payload);
-    if (decoder.isComplete) break;
+    if (decoder.isComplete && receivedManifest) break;
   }
 
   if (!decoder?.isComplete || !receivedManifest) {
@@ -224,21 +236,26 @@ describe('端到端 loopback', () => {
     const scratch = new Uint8Array(packed.manifest.blockSize);
 
     // 發送端已經播咗一大輪，接收端先至開始睇
+    const period = manifestPeriod(packed.manifest.blockCount);
     const SKIP = 137;
     for (let i = 0; i < SKIP; i++) {
-      if (i % 12 !== 0) encoder.next(scratch);
+      if (i % period !== 0) encoder.next(scratch);
     }
 
     let decoder: LtDecoder | null = null;
     let manifest: Manifest | null = null;
+    let blockSize = 0;
+    let framesUntilFirstBlock = -1;
     let frameIndex = SKIP;
+    let seen = 0;
 
     while (frameIndex < SKIP + packed.manifest.blockCount * 6) {
-      const isManifest = frameIndex % 12 === 0;
+      const isManifest = frameIndex % period === 0;
       const frame = isManifest
         ? manifestFrame
-        : encodeDataFrame(sessionId, encoder.next(scratch), scratch);
+        : encodeDataFrame(sessionId, encoder.next(scratch), packed.manifest, scratch);
       frameIndex++;
+      seen++;
 
       const bytes = await throughOpticalChannel(frame, profile);
       if (!bytes) continue;
@@ -246,24 +263,41 @@ describe('端到端 loopback', () => {
       if (!parsed) continue;
 
       if (parsed.kind === 'manifest') {
-        if (!manifest) {
-          manifest = parsed.manifest;
-          decoder = new LtDecoder(manifest.blockCount, manifest.blockSize);
-        }
+        if (!manifest && blockSize > 0) manifest = { ...parsed.manifest, blockSize };
         continue;
       }
-      if (!decoder) continue; // manifest 未到，data 幀冇得用
+      if (!decoder) {
+        blockSize = parsed.stream.blockSize;
+        decoder = new LtDecoder(parsed.stream.blockCount, blockSize);
+        if (framesUntilFirstBlock < 0) framesUntilFirstBlock = seen;
+      }
       decoder.push(parsed.seed, parsed.payload);
-      if (decoder.isComplete) break;
+      if (decoder.isComplete && manifest) break;
     }
 
     expect(decoder?.isComplete).toBe(true);
     const unpacked = await unpackPayload(decoder!.assemble(manifest!.payloadSize), manifest!);
     expect(unpacked.hashOk).toBe(true);
     expect(unpacked.bytes).toEqual(original);
-    // 插播週期係 12，所以最多等 12 幀就 lock 到
-    expect(frameIndex - SKIP).toBeLessThan(packed.manifest.blockCount * 6);
+    // v2 嘅重點：第一個 DATA 幀就開始砌，唔使等 manifest。
+    // 只要唔係啱啱撞正 manifest 幀，第一幀就應該收到
+    expect(framesUntilFirstBlock).toBeLessThanOrEqual(2);
   }, 300_000);
+
+  it('v2 自述式表頭真係慳到頻寬（對比 v1 嘅每 12 幀插播）', () => {
+    // v1：每幀表頭 12 B，但每 12 幀就有一幀係純 manifest（唔載任何資料）
+    // v2：每幀表頭 20 B（多帶 blockCount + payloadSize），
+    //     manifest 最疏降到每 32 幀
+    for (const profile of [PROFILES.turbo, PROFILES.balanced, PROFILES.safe]) {
+      const v1Effective = (((profile.capacity - 12) & ~3) * 11) / 12;
+      const v2Effective = (profile.blockSize * 31) / 32;
+      const gain = v2Effective / v1Effective - 1;
+      console.log(
+        `${profile.label}：v1 ${v1Effective.toFixed(0)} → v2 ${v2Effective.toFixed(0)} B/幀（+${(gain * 100).toFixed(1)}%）`,
+      );
+      expect(gain, `${profile.label} 冇慳到`).toBeGreaterThan(0.03);
+    }
+  });
 
   it('SHA-256 真係捉得到損壞（唔係擺個樣）', async () => {
     const original = incompressibleBytes(5_000, 5);

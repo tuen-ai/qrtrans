@@ -1,6 +1,6 @@
 import { Camera } from '../render/camera';
 import { ScreenWakeLock } from '../render/wake-lock';
-import { decodeFrame, type Manifest } from '../protocol/frame';
+import { decodeFrame, type Manifest, type StreamInfo } from '../protocol/frame';
 import { LtDecoder, expectedPackets } from '../protocol/lt-decoder';
 import { unpackPayload, type Unpacked } from '../codec/unpack';
 import { StatsPanel, RateMeter, formatBytes, formatRate, formatDuration } from './stats';
@@ -93,6 +93,9 @@ export class ReceiverView {
   private readonly decodeMeter = new RateMeter();
 
   private session: number | null = null;
+  /** 由 DATA 幀自述嘅資料 —— 收到第一幀就有 */
+  private stream: StreamInfo | null = null;
+  /** 由 MANIFEST 幀帶嘅檔案資料 —— 完成前一定要有 */
   private manifest: Manifest | null = null;
   private decoder: LtDecoder | null = null;
   private readonly foreignSessions = new Map<number, number>();
@@ -193,6 +196,7 @@ export class ReceiverView {
 
   private resetSession(): void {
     this.session = null;
+    this.stream = null;
     this.manifest = null;
     this.decoder = null;
     this.foreignSessions.clear();
@@ -349,40 +353,75 @@ export class ReceiverView {
       return;
     }
 
-    if (this.decoder === null || frame.sessionId !== this.session) return;
-    if (frame.payload.length !== this.decoder.blockSize) return;
+    // v2：DATA 幀自述 blockCount / payloadSize，所以**第一個解到嘅幀就
+    // 可以開始砌**，唔使等 manifest。以前喺等 manifest 期間收到嘅幀
+    // 全部要掉，白白蝕咗成秒鐘嘅資料
+    if (!this.adoptSession(frame.sessionId, frame.stream)) return;
+    if (frame.payload.length !== this.decoder!.blockSize) return;
 
-    this.decoder.push(frame.seed, frame.payload);
-    if (this.decoder.isComplete) void this.finish();
+    this.decoder!.push(frame.seed, frame.payload);
+    if (this.decoder!.isComplete) void this.finish();
   }
 
-  private handleManifest(sessionId: number, manifest: Manifest): void {
-    if (this.session === sessionId) return;
+  /**
+   * 決定收唔收呢個 session 嘅幀，需要就開一個新 decoder。
+   * 回傳 false 代表呢一幀應該掉咗。
+   */
+  private adoptSession(sessionId: number, stream: StreamInfo): boolean {
+    if (this.session === sessionId) return true;
 
     if (this.session !== null) {
       // 已經收緊另一個 session。發送端可能換咗檔案重播 —— 但都可能係
       // 一個誤解碼，所以要見到幾次先切換，唔好將收咗一半嘅進度扔咗
       const seen = (this.foreignSessions.get(sessionId) ?? 0) + 1;
       this.foreignSessions.set(sessionId, seen);
-      if (seen < SESSION_SWITCH_THRESHOLD) return;
+      if (seen < SESSION_SWITCH_THRESHOLD) return false;
     }
 
     this.session = sessionId;
-    this.manifest = manifest;
-    this.decoder = new LtDecoder(manifest.blockCount, manifest.blockSize);
+    this.stream = stream;
+    this.manifest = null; // 新 session，舊檔案資料唔再算數
+    this.decoder = new LtDecoder(stream.blockCount, stream.blockSize);
     this.foreignSessions.clear();
     this.startedAt = performance.now();
 
     this.stats.set('SESSION', sessionId.toString(16).toUpperCase().padStart(4, '0'));
-    this.stats.set('BLOCK LEN', `${manifest.blockSize} B`);
-    this.stats.set('PAYLOAD', formatBytes(manifest.payloadSize));
+    this.stats.set('BLOCK LEN', `${stream.blockSize} B`);
+    this.stats.set('PAYLOAD', formatBytes(stream.payloadSize));
+    this.progressLabel.textContent = `收緊 ${formatBytes(stream.payloadSize)}…`;
+    return true;
+  }
+
+  /**
+   * MANIFEST 幀只帶「完成嗰陣先需要」嘅嘢：檔名、MIME、SHA-256、gzip flag。
+   * 佢**唔會**再開 decoder —— 嗰個責任已經交咗畀 DATA 幀。
+   */
+  private handleManifest(sessionId: number, manifest: Omit<Manifest, 'blockSize'>): void {
+    // 未見過任何 DATA 幀就唔好認 —— blockSize 只有 DATA 幀先知
+    if (this.session !== sessionId || !this.stream) return;
+    if (this.manifest) return; // 已經有咗，之後嘅插播唔使理
+
+    if (manifest.blockCount !== this.stream.blockCount || manifest.payloadSize !== this.stream.payloadSize) {
+      return; // 同 DATA 幀講嘅對唔上，寧可等下一個
+    }
+
+    this.manifest = { ...manifest, blockSize: this.stream.blockSize };
     this.progressLabel.textContent = `${manifest.fileName} · ${formatBytes(manifest.originalSize)}`;
+
+    // 有可能 block 已經收齊咗，淨係等緊 manifest 先砌得成個檔案
+    if (this.decoder?.isComplete) void this.finish();
   }
 
   private async finish(): Promise<void> {
     const decoder = this.decoder;
     const manifest = this.manifest;
-    if (!decoder || !manifest) return;
+    if (!decoder) return;
+    if (!manifest) {
+      // Block 收齊咗但 manifest 未到（細檔案有機會咁）。繼續掃住等 ——
+      // manifest 每 4–32 幀就插播一次，好快就會嚟
+      this.progressLabel.textContent = '資料收齊晒，等緊檔案資料…';
+      return;
+    }
 
     const elapsed = performance.now() - this.startedAt;
     this.teardown();

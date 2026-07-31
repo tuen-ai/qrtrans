@@ -1,5 +1,10 @@
 import { LtEncoder } from '../protocol/lt-encoder';
-import { encodeManifestFrame, encodeDataFrame, type Manifest } from '../protocol/frame';
+import {
+  encodeManifestFrame,
+  encodeDataFrame,
+  manifestPeriod,
+  type Manifest,
+} from '../protocol/frame';
 import { encodeQrMatrix, getProfile, type ProfileId } from '../render/qr-encode';
 
 /**
@@ -19,8 +24,6 @@ export interface StartMessage {
   manifest: Manifest;
   profileId: ProfileId;
   sessionId: number;
-  /** 隔幾多幀插播一次 manifest */
-  manifestPeriod: number;
   /** 預先準備幾多幀 */
   prebuffer: number;
 }
@@ -57,15 +60,17 @@ function post(msg: FromWorker, transfer: Transferable[] = []): void {
 function produceFrame(): void {
   if (!encoder || !config || !manifestFrame || !scratch) return;
   const profile = getProfile(config.profileId);
+  const period = manifestPeriod(config.manifest.blockCount);
 
   // 每 manifestPeriod 幀插播一次 manifest，令接收端隨時舉起手機都 lock 得到
-  const isManifest = frameIndex % config.manifestPeriod === 0;
+  const isManifest = frameIndex % period === 0;
   let frameBytes: Uint8Array;
   if (isManifest) {
     frameBytes = manifestFrame;
   } else {
     const seed = encoder.next(scratch);
-    frameBytes = encodeDataFrame(config.sessionId, seed, scratch);
+    // 每個 DATA 幀都自述 blockCount / payloadSize，令接收端第一幀就開始砌
+    frameBytes = encodeDataFrame(config.sessionId, seed, config.manifest, scratch);
   }
 
   const matrix = encodeQrMatrix(frameBytes, profile);

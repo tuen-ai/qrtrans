@@ -115,14 +115,20 @@ describe('QR 二進位往返', () => {
 
       it('blockSize 對齊 4 而且啱啱好連表頭塞得落一幀', () => {
         expect(profile.blockSize % 4).toBe(0);
-        const frame = encodeDataFrame(1, 2, new Uint8Array(profile.blockSize));
+        const frame = encodeDataFrame(
+          1,
+          2,
+          { blockCount: 1, payloadSize: profile.blockSize },
+          new Uint8Array(profile.blockSize),
+        );
         expect(frame.length).toBeLessThanOrEqual(profile.capacity);
         expect(() => encodeQrMatrix(frame, profile)).not.toThrow();
       });
 
       it('完整一幀（DATA 幀 → QR → 解碼 → 幀解析）行得通', async () => {
         const block = randomBytes(profile.blockSize, profile.version * 31);
-        const frame = encodeDataFrame(0xa5a5, 0x12345678, block);
+        const stream = { blockCount: 1, payloadSize: profile.blockSize };
+        const frame = encodeDataFrame(0xa5a5, 0x12345678, stream, block);
         const decodedBytes = await decodeMatrix(encodeQrMatrix(frame, profile));
         expect(decodedBytes).not.toBeNull();
 
@@ -131,6 +137,7 @@ describe('QR 二進位往返', () => {
         if (parsed?.kind !== 'data') throw new Error('unreachable');
         expect(parsed.sessionId).toBe(0xa5a5);
         expect(parsed.seed).toBe(0x12345678);
+        expect(parsed.stream.blockSize).toBe(profile.blockSize);
         expect(parsed.payload).toEqual(block);
       });
     });

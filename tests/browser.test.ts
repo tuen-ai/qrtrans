@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 
 import { packFile } from '../src/codec/pack';
 import { LtEncoder } from '../src/protocol/lt-encoder';
-import { encodeManifestFrame, encodeDataFrame } from '../src/protocol/frame';
+import { encodeManifestFrame, encodeDataFrame, manifestPeriod } from '../src/protocol/frame';
 import { encodeQrMatrix, PROFILES } from '../src/render/qr-encode';
 import { Prng } from '../src/protocol/prng';
 
@@ -141,9 +141,12 @@ async function buildQrVideo(path: string, payloadBytes: Uint8Array): Promise<{ s
   const header = Buffer.from(`YUV4MPEG2 W${VIDEO_SIZE} H${VIDEO_SIZE} F${VIDEO_FPS}:1 Ip A1:1 C420jpeg\n`);
   const chunks: Buffer[] = [header];
 
+  const period = manifestPeriod(packed.manifest.blockCount);
   for (let i = 0; i < VIDEO_FRAMES; i++) {
     const frameBytes =
-      i % 12 === 0 ? manifestFrame : encodeDataFrame(sessionId, encoder.next(scratch), scratch);
+      i % period === 0
+        ? manifestFrame
+        : encodeDataFrame(sessionId, encoder.next(scratch), packed.manifest, scratch);
     const { size, modules } = encodeQrMatrix(frameBytes, profile);
     chunks.push(Buffer.from('FRAME\n'));
     chunks.push(Buffer.from(qrToYuvFrame(size, modules, VIDEO_SIZE)));
@@ -191,8 +194,17 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
       await page.goto(base, { waitUntil: 'networkidle' });
 
       await page.evaluate(() => {
-        const bytes = new Uint8Array(40_000);
-        for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 31 + (i >> 7)) & 0xff;
+        // 用不可壓縮嘅內容：壓得細嘅話 K 會好細，manifest 插播週期跟住縮到
+        // 最密（每 4 幀），咁樣取樣就會不斷撞到同一個 manifest 幀
+        const bytes = new Uint8Array(120_000);
+        let s = 0x12345678;
+        for (let i = 0; i < bytes.length; i++) {
+          s = (s + 0x9e3779b9) | 0;
+          let t = s ^ (s >>> 16);
+          t = Math.imul(t, 0x21f0aaad);
+          t ^= t >>> 15;
+          bytes[i] = t & 0xff;
+        }
         const dt = new DataTransfer();
         dt.items.add(new File([bytes], 'browser-test.bin', { type: 'application/octet-stream' }));
         const input = document.querySelector<HTMLInputElement>('#file-input')!;

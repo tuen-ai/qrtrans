@@ -1,4 +1,5 @@
 import { packFile, SOFT_SIZE_LIMIT } from '../codec/pack';
+import { manifestPeriod } from '../protocol/frame';
 import { PROFILES, DEFAULT_PROFILE, getProfile, type ProfileId } from '../render/qr-encode';
 import { QrPainter } from '../render/qr-painter';
 import { ScreenWakeLock } from '../render/wake-lock';
@@ -12,8 +13,6 @@ import type { FromWorker, ToWorker } from '../workers/encode.worker';
  * 所有重工（fountain 產包 + QR 編碼）都喺 worker，所以幀率好穩。
  */
 
-/** 隔幾多幀插播一次 manifest。太疏 → 接收端要等好耐先 lock 到；太密 → 蝕頻寬。 */
-const MANIFEST_PERIOD = 12;
 /** 預先準備幾多幀。太少會斷流，太多食記憶體又令 stop 反應慢。 */
 const PREBUFFER = 8;
 
@@ -65,6 +64,8 @@ export class SenderView {
 
   private startedAt = 0;
   private framesShown = 0;
+  /** 目前播緊嘅檔案切咗幾多個 block（計理論吞吐用） */
+  private blockCount = 1;
   private lastFrameAt = 0;
   private readonly fpsMeter = new RateMeter();
   /** 播放期間唔畀螢幕熄／變暗 —— 一暗 QR 就解唔到 */
@@ -219,6 +220,7 @@ export class SenderView {
     );
     this.stats.set('BLOCK LEN', `${packed.manifest.blockSize} B`);
     this.stats.set('BLOCK 數 (K)', String(packed.manifest.blockCount));
+    this.blockCount = packed.manifest.blockCount;
     this.stats.set('目標 FPS', String(this.targetFps));
     this.stats.set('SESSION', sessionId.toString(16).toUpperCase().padStart(4, '0'));
     this.stats.start();
@@ -235,7 +237,6 @@ export class SenderView {
       manifest: packed.manifest,
       profileId: profile.id,
       sessionId,
-      manifestPeriod: MANIFEST_PERIOD,
       prebuffer: PREBUFFER,
     };
     // payload 直接 transfer 過去，唔使複製（之後主線程用唔著佢）
@@ -296,7 +297,7 @@ export class SenderView {
 
     const profile = getProfile(this.selectedProfileId());
     // 「理論吞吐」= 假設接收端一幀都唔漏嘅上限，用嚟同接收端實際 goodput 對比
-    const dataFraction = 1 - 1 / MANIFEST_PERIOD;
+    const dataFraction = 1 - 1 / manifestPeriod(this.blockCount);
     this.stats.set('理論吞吐', formatRate(profile.blockSize * this.targetFps * dataFraction));
   }
 
