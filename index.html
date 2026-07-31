@@ -23,10 +23,12 @@
                worker-src 'self' blob:;
                object-src 'none';
                base-uri 'none';
-               form-action 'none';
-               frame-ancestors 'none'"
+               form-action 'none'"
     />
+    <!-- 註：frame-ancestors 喺 <meta> 度會被瀏覽器忽略，只有 HTTP header 先生效，
+         所以唔擺喺度。GitHub Pages 送唔到自訂 header，呢一項要靠部署層提供。 -->
 
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
     <title>QRTRANS — 閃爍 QR 離線檔案傳輸</title>
     <meta
       name="description"

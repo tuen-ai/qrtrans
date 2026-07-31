@@ -20,13 +20,14 @@ describe('Prng', () => {
   });
 
   it('輸出永遠喺 uint32 範圍', () => {
+    // 喺迴圈入面逐次 expect 會慢到 timeout，所以累積咗先一次過斷言
     const rng = new Prng(0);
-    for (let i = 0; i < 10000; i++) {
+    let bad = 0;
+    for (let i = 0; i < 100_000; i++) {
       const v = rng.next();
-      expect(Number.isInteger(v)).toBe(true);
-      expect(v).toBeGreaterThanOrEqual(0);
-      expect(v).toBeLessThanOrEqual(0xffffffff);
+      if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) bad++;
     }
+    expect(bad).toBe(0);
   });
 
   it('相鄰 seed 嘅數列唔相關（我哋嘅 seed 就係遞增 counter）', () => {
@@ -45,15 +46,17 @@ describe('Prng', () => {
     const n = 10;
     const counts = new Array<number>(n).fill(0);
     const trials = 200_000;
+    let outOfRange = 0;
     for (let i = 0; i < trials; i++) {
       const v = rng.nextInt(n);
-      expect(v).toBeGreaterThanOrEqual(0);
-      expect(v).toBeLessThan(n);
-      counts[v]!++;
+      if (v < 0 || v >= n) outOfRange++;
+      else counts[v]!++;
     }
-    for (const c of counts) {
-      expect(Math.abs(c - trials / n) / (trials / n)).toBeLessThan(0.05);
-    }
+    expect(outOfRange).toBe(0);
+
+    const expected = trials / n;
+    const worstDeviation = Math.max(...counts.map((c) => Math.abs(c - expected) / expected));
+    expect(worstDeviation).toBeLessThan(0.05);
   });
 
   it('nextInt(1) 永遠 0，n <= 0 要掟錯', () => {

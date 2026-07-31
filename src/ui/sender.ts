@@ -59,6 +59,8 @@ export class SenderView {
   private queue: QueuedFrame[] = [];
   private rafId: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
+  /** 上次量尺寸嗰陣係幾多個模組；變咗就要重新量 */
+  private sizedFor = 0;
 
   private startedAt = 0;
   private framesShown = 0;
@@ -269,6 +271,8 @@ export class SenderView {
     if (!frame) return; // worker 未追到，今個刷新維持上一幀
 
     this.painter.setMatrix(frame.size, frame.modules);
+    // 第一幀到咗（或者用戶轉咗檔位令 QR 版本變）之後先至知道要點樣量尺寸
+    if (this.sizedFor !== this.painter.modulesPerSide) this.applySize();
     this.painter.draw();
     this.worker?.postMessage({ type: 'ack' } satisfies ToWorker);
 
@@ -292,17 +296,32 @@ export class SenderView {
     this.stats.set('理論吞吐', formatRate(profile.blockSize * this.targetFps * dataFraction));
   }
 
+  /**
+   * 重新計 QR 顯示尺寸。
+   *
+   * 一定要由**闊度**同視窗高度去計，唔可以用 `.qr-stage` 嘅高度 ——
+   * 個 stage 嘅高度係由入面個 canvas 撐起嘅，攞佢嚟計就會變成循環依賴，
+   * canvas 會永遠卡喺 300px 預設值。
+   */
+  private applySize = (): void => {
+    if (this.painter.modulesPerSide === 0) return;
+    const pad = 24; // .qr-stage 上下左右嘅 padding
+    const available = Math.min(
+      this.stage.clientWidth - pad,
+      // 留返位畀統計面板同掣，唔好要用戶捲屏先見到成個 QR
+      window.innerHeight * 0.62,
+    );
+    this.painter.resize(Math.max(120, available), window.devicePixelRatio || 1);
+    this.sizedFor = this.painter.modulesPerSide;
+    this.painter.draw();
+  };
+
   private observeResize(): void {
-    const apply = () => {
-      const rect = this.stage.getBoundingClientRect();
-      const pad = 24; // .qr-stage 嘅 padding
-      const size = Math.max(120, Math.min(rect.width - pad, rect.height - pad || Infinity));
-      this.painter.resize(size, window.devicePixelRatio || 1);
-      this.painter.draw();
-    };
-    this.resizeObserver = new ResizeObserver(apply);
-    this.resizeObserver.observe(this.stage);
-    apply();
+    this.resizeObserver = new ResizeObserver(this.applySize);
+    // 觀察 stage 嘅父元素：佢嘅闊度先係真正嘅可用空間
+    this.resizeObserver.observe(this.stage.parentElement ?? this.stage);
+    window.addEventListener('resize', this.applySize);
+    this.applySize();
   }
 
   private toggleFullscreen(): void {
@@ -328,6 +347,8 @@ export class SenderView {
     }
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    window.removeEventListener('resize', this.applySize);
+    this.sizedFor = 0;
 
     this.worker?.postMessage({ type: 'stop' } satisfies ToWorker);
     this.worker?.terminate();
