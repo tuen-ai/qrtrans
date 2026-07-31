@@ -1,6 +1,7 @@
 import { packFile, SOFT_SIZE_LIMIT } from '../codec/pack';
 import { PROFILES, DEFAULT_PROFILE, getProfile, type ProfileId } from '../render/qr-encode';
 import { QrPainter } from '../render/qr-painter';
+import { ScreenWakeLock } from '../render/wake-lock';
 import { StatsPanel, RateMeter, formatBytes, formatRate, formatDuration } from './stats';
 import type { FromWorker, ToWorker } from '../workers/encode.worker';
 
@@ -66,6 +67,8 @@ export class SenderView {
   private framesShown = 0;
   private lastFrameAt = 0;
   private readonly fpsMeter = new RateMeter();
+  /** 播放期間唔畀螢幕熄／變暗 —— 一暗 QR 就解唔到 */
+  private readonly wakeLock = new ScreenWakeLock();
   private targetFps = 30;
   private running = false;
 
@@ -238,6 +241,7 @@ export class SenderView {
     // payload 直接 transfer 過去，唔使複製（之後主線程用唔著佢）
     this.worker.postMessage(startMsg, [packed.payload.buffer]);
 
+    void this.wakeLock.request();
     this.observeResize();
     this.rafId = requestAnimationFrame((t) => this.tick(t));
   }
@@ -341,6 +345,7 @@ export class SenderView {
 
   stop(): void {
     this.running = false;
+    this.wakeLock.release();
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;

@@ -1,6 +1,7 @@
 import { Camera } from '../render/camera';
+import { ScreenWakeLock } from '../render/wake-lock';
 import { decodeFrame, type Manifest } from '../protocol/frame';
-import { LtDecoder } from '../protocol/lt-decoder';
+import { LtDecoder, expectedPackets } from '../protocol/lt-decoder';
 import { unpackPayload, type Unpacked } from '../codec/unpack';
 import { StatsPanel, RateMeter, formatBytes, formatRate, formatDuration } from './stats';
 import type { DecodeRequest, DecodeResponse } from '../workers/decode.worker';
@@ -75,6 +76,8 @@ export class ReceiverView {
   private readonly stats: StatsPanel;
 
   private readonly camera: Camera;
+  /** 掃描期間唔畀螢幕熄 —— 一熄相機就停 */
+  private readonly wakeLock = new ScreenWakeLock();
   private pool: PoolWorker[] = [];
   private readonly inflight = new Map<number, InFlight>();
   private requestId = 0;
@@ -135,6 +138,7 @@ export class ReceiverView {
       this.resetSession();
       this.spawnPool();
       await this.camera.start();
+      void this.wakeLock.request();
     } catch (err) {
       this.teardown();
       this.showError(this.explainCameraError(err));
@@ -178,6 +182,7 @@ export class ReceiverView {
 
   private teardown(): void {
     this.running = false;
+    this.wakeLock.release();
     this.camera.stop();
     for (const pw of this.pool) pw.worker.terminate();
     this.pool = [];
@@ -474,11 +479,13 @@ export class ReceiverView {
     const goodput = (decoder.solvedBlocks * decoder.blockSize) / ((now - this.startedAt) / 1000);
     this.stats.set('GOODPUT', formatRate(goodput), 'hot');
 
-    const pct = decoder.progress * 100;
+    // 用估算進度而唔係已解 block 數 —— 後者喺整個傳輸期間都會釘死喺 0%
+    // 然後最後一刻彈到 100%（見 LtDecoder.estimatedProgress 嘅註釋）
+    const pct = decoder.estimatedProgress * 100;
     this.progressBar.style.width = `${pct.toFixed(1)}%`;
     if (this.manifest) {
       this.progressLabel.textContent =
-        `${this.manifest.fileName} · ${decoder.solvedBlocks}/${decoder.blockCount} block（${pct.toFixed(1)}%）`;
+        `${this.manifest.fileName} · 收到 ${decoder.packetsNew} / 約 ${Math.ceil(expectedPackets(decoder.blockCount))} 幀（${pct.toFixed(0)}%）`;
     }
   }
 
