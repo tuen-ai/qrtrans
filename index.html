@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-Hant-HK">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b0d10" />
+
+    <!--
+      私隱防線：呢個 app 唔應該同任何外部網域講嘢。
+      connect-src 'self' 令 fetch / XHR / WebSocket / sendBeacon 全部出唔到街，
+      img-src 排除咗外部網域 —— 連 CSS background-image 都做唔到外送通道。
+      即使將來有人唔小心加咗個網絡請求，瀏覽器都會直接擋。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self';
+               connect-src 'self';
+               script-src 'self' 'wasm-unsafe-eval';
+               style-src 'self' 'unsafe-inline';
+               img-src 'self' blob: data:;
+               media-src 'self' blob:;
+               worker-src 'self' blob:;
+               object-src 'none';
+               base-uri 'none';
+               form-action 'none';
+               frame-ancestors 'none'"
+    />
+
+    <title>QRTRANS — 閃爍 QR 離線檔案傳輸</title>
+    <meta
+      name="description"
+      content="用快速閃爍嘅二維碼喺兩部裝置之間傳檔案。唔使網絡、唔使藍牙、唔使配對，檔案唔會離開你部裝置。"
+    />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">QRTRANS</span>
+          <span class="brand-sub">— 閃爍 QR 離線檔案傳輸</span>
+        </div>
+        <nav class="tabs" role="tablist" aria-label="模式">
+          <button class="tab" role="tab" data-mode="send" aria-selected="true">發送</button>
+          <button class="tab" role="tab" data-mode="receive" aria-selected="false">接收</button>
+        </nav>
+      </header>
+
+      <p class="privacy-note">
+        <strong>🔒 檔案唔會離開你部裝置。</strong>
+        冇伺服器、冇上傳、冇任何網絡請求 —— 資料淨係經螢幕上嘅光同相機傳送。
+      </p>
+
+      <!-- ══════════════════════ 發送 ══════════════════════ -->
+      <section class="view" id="view-send" role="tabpanel">
+        <div class="panel setup" id="send-setup">
+          <label class="dropzone" id="drop-zone" tabindex="0">
+            <input type="file" id="file-input" hidden />
+            <span class="dropzone-icon" aria-hidden="true">＋</span>
+            <span class="dropzone-title">揀一個檔案，或者拖入嚟</span>
+            <span class="dropzone-hint">建議 8 MB 以內；大檔案會播好耐</span>
+          </label>
+
+          <div class="controls">
+            <div class="control">
+              <label for="profile-select">QR 密度</label>
+              <select id="profile-select"></select>
+              <small id="profile-hint"></small>
+            </div>
+            <div class="control">
+              <label for="fps-select">播放幀率</label>
+              <select id="fps-select">
+                <option value="60">60 fps</option>
+                <option value="30" selected>30 fps</option>
+                <option value="20">20 fps</option>
+                <option value="15">15 fps</option>
+                <option value="10">10 fps</option>
+              </select>
+              <small>螢幕反應唔切嘅話，調低反而快啲收完</small>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button class="btn primary" id="send-start" disabled>開始播放</button>
+          </div>
+          <p class="error" id="send-error" hidden></p>
+        </div>
+
+        <div class="panel playing" id="send-playing" hidden>
+          <div class="stats" id="send-stats"></div>
+          <div class="qr-stage" id="qr-stage">
+            <canvas id="qr-canvas"></canvas>
+          </div>
+          <div class="actions">
+            <button class="btn" id="send-fullscreen">全螢幕</button>
+            <button class="btn danger" id="send-stop">停止</button>
+          </div>
+          <p class="tip">
+            將手機鏡頭對正個 QR，維持成個碼連白邊都喺畫面入面。螢幕亮度較高啲、熄咗自動亮度會穩定好多。
+          </p>
+        </div>
+      </section>
+
+      <!-- ══════════════════════ 接收 ══════════════════════ -->
+      <section class="view" id="view-receive" role="tabpanel" hidden>
+        <div class="panel setup" id="recv-setup">
+          <p class="lead">用呢部機嘅鏡頭去掃另一部機上面閃緊嘅 QR。</p>
+          <div class="actions">
+            <button class="btn primary" id="recv-start">開啟鏡頭</button>
+          </div>
+          <p class="error" id="recv-error" hidden></p>
+          <p class="tip">
+            需要 HTTPS 先用得鏡頭。喺 iPhone 上請用 Safari；部分內置瀏覽器（IG / FB / 微信）唔畀開鏡頭。
+          </p>
+        </div>
+
+        <div class="panel scanning" id="recv-scanning" hidden>
+          <div class="stats" id="recv-stats"></div>
+          <div class="progress-wrap">
+            <div class="progress"><div class="progress-bar" id="recv-progress"></div></div>
+            <span class="progress-label" id="recv-progress-label">等緊 manifest…</span>
+          </div>
+          <div class="camera-stage">
+            <video id="camera-video" playsinline muted autoplay></video>
+            <div class="roi-box" id="roi-box" hidden></div>
+          </div>
+          <div class="actions">
+            <button class="btn danger" id="recv-stop">停止</button>
+          </div>
+        </div>
+
+        <div class="panel done" id="recv-done" hidden>
+          <div class="done-banner" id="recv-banner"></div>
+          <div class="done-meta" id="recv-meta"></div>
+          <div class="actions">
+            <button class="btn primary" id="recv-download">下載檔案</button>
+            <button class="btn" id="recv-again">再掃一個</button>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer">
+        純靜態、零後端。原始碼公開，檔案唔公開。
+      </footer>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

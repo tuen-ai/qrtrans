@@ -17,6 +17,7 @@
     "zxing-wasm": "^3.1.2"
   },
   "devDependencies": {
+    "@types/node": "^22.20.1",
     "@vitejs/plugin-basic-ssl": "^2.1.0",
     "typescript": "^5.9.2",
     "vite": "^7.1.5",
