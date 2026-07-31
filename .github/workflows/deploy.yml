@@ -1,0 +1,58 @@
+name: 部署到 GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 只需要讀 repo + 寫 Pages，唔好畀多餘權限
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一時間只跑一個部署；排住隊嘅就取消，唔好等
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # 真瀏覽器測試（包括用假鏡頭跑完整接收端）要有 Chromium；
+      # 冇裝嘅話嗰兩個測試會自動跳過，但我哋想 CI 真係跑到
+      - name: 裝 Chromium
+        run: npx playwright install --with-deps chromium
+
+      # 測試包含私隱防線檢查（唔准有外送 API、唔准有外部網域、
+      # build 產物唔准有 CDN 主機），唔過就唔部署
+      - name: 跑測試
+        run: npm run test:ci
+
+      - name: Build
+        run: npm run build
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -35,9 +35,21 @@ const VIDEO_FPS = 30;
 /** 生成幾多幀。要夠多先收得齊（實測掉幀之下大約 1.5–2 × K）。 */
 const VIDEO_FRAMES = 120;
 
+/**
+ * 搵一個行得嘅 Chromium：先睇環境有冇預先裝好嘅，冇就用 Playwright
+ * 自己下載嗰個。兩樣都冇（例如淨係 `npm ci` 冇 `playwright install`）
+ * 就跳過呢啲測試，而唔係成個 CI 爆。
+ */
 function findChromium(): string | undefined {
-  const candidates = globSync('/opt/pw-browsers/chromium-*/chrome-linux/chrome');
-  return candidates[0];
+  const preinstalled = globSync('/opt/pw-browsers/chromium-*/chrome-linux/chrome')[0];
+  if (preinstalled) return preinstalled;
+  try {
+    const bundled = chromium.executablePath();
+    if (bundled && existsSync(bundled)) return bundled;
+  } catch {
+    // Playwright 未下載過瀏覽器
+  }
+  return undefined;
 }
 
 // ── 靜態伺服器 ──────────────────────────────────────────
