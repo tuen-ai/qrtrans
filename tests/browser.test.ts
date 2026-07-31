@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { chromium, type Browser } from 'playwright';
-import { execFileSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { existsSync, globSync } from 'node:fs';
@@ -166,9 +165,6 @@ let server: Server;
 let base: string;
 
 beforeAll(async () => {
-  if (!existsSync(join(DIST, 'index.html'))) {
-    execFileSync('npx', ['vite', 'build'], { cwd: REPO, stdio: 'pipe' });
-  }
   await mkdir(workDir, { recursive: true });
   ({ server, base } = await serveDist());
 }, 180_000);
@@ -261,6 +257,95 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
         (u) => !u.startsWith(base) && !u.startsWith('blob:') && !u.startsWith('data:'),
       );
       expect(external).toEqual([]);
+    } finally {
+      await browser.close();
+    }
+  }, 180_000);
+
+  it('PWA：service worker 裝到，之後完全離線都開得到 app', async () => {
+    const browser = await chromium.launch({ executablePath: chromiumPath });
+    try {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      const pageErrors: string[] = [];
+      page.on('pageerror', (e) => pageErrors.push(String(e)));
+
+      await page.goto(base, { waitUntil: 'networkidle' });
+
+      // 等到 SW 真係 activated 而且已經接管咗呢一頁。
+      //
+      // 唔可以淨係 await `serviceWorker.ready` —— 佢喺 worker 一入 active
+      // 槽就 resolve，嗰陣 state 仲係 'activating'，要再過幾毫秒先變
+      // 'activated'。真正要等嘅係 `controller`：冇佢頁面就唔受 SW 管，
+      // 離線導覽一樣會死
+      // 用輪詢而唔係事件監聽：監聽器有 attach 時機嘅競態（事件可能喺
+      // 我哋掛上去之前就已經派完），一 miss 就變成吊死到 timeout，
+      // 完全冇診斷資訊。輪詢超時會直接報出當時嘅真實狀態
+      const swState = await page.evaluate(async () => {
+        const deadline = Date.now() + 30_000;
+        for (;;) {
+          const reg = await navigator.serviceWorker.getRegistration();
+          const state = reg?.active?.state ?? 'none';
+          const controlled = !!navigator.serviceWorker.controller;
+          if ((state === 'activated' && controlled) || Date.now() > deadline) {
+            return { state, controlled };
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      });
+      expect(swState).toEqual({ state: 'activated', controlled: true });
+
+      // 確認 precache 真係入咗 cache，唔係得個殼
+      const cached = await page.evaluate(async () => {
+        const names = await caches.keys();
+        const name = names.find((n) => n.startsWith('qrtrans-'));
+        if (!name) return null;
+        const keys = await (await caches.open(name)).keys();
+        return { name, urls: keys.map((r) => new URL(r.url).pathname) };
+      });
+      expect(cached, '搵唔到 qrtrans- 開頭嘅 cache').not.toBeNull();
+      // 核心功能所需嘅嘢一個都唔可以少
+      expect(cached!.urls.some((u) => u.endsWith('.wasm')), '冇快取 wasm').toBe(true);
+      expect(cached!.urls.some((u) => /encode\.worker/.test(u)), '冇快取 encode worker').toBe(true);
+      expect(cached!.urls.some((u) => /decode\.worker/.test(u)), '冇快取 decode worker').toBe(true);
+
+      // ── 拔網線 ──
+      await context.setOffline(true);
+      await page.goto(base, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+
+      // app shell 要由 cache 出返嚟
+      await page.waitForSelector('#view-send:not([hidden])', { timeout: 15_000 });
+      expect(await page.textContent('.brand-mark')).toContain('QRTRANS');
+
+      // 更緊要嘅係：離線之下核心功能仲要行得。
+      // 揀個檔案、開始播 —— 呢一步會 load encode worker（lazy 嘅），
+      // 冇快取到就會喺度死
+      await page.evaluate(() => {
+        const bytes = new Uint8Array(5_000);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
+        const dt = new DataTransfer();
+        dt.items.add(new File([bytes], 'offline.bin', { type: 'application/octet-stream' }));
+        const input = document.querySelector<HTMLInputElement>('#file-input')!;
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await page.click('#send-start');
+      await page.waitForSelector('#send-playing:not([hidden])', { timeout: 15_000 });
+      await page.waitForFunction(
+        () => (document.querySelector('#qr-canvas') as HTMLCanvasElement).width !== 300,
+        { timeout: 15_000 },
+      );
+      await page.waitForTimeout(800);
+
+      const framesShown = await page.evaluate(() => {
+        const cell = [...document.querySelectorAll('#send-stats .stat')].find(
+          (el) => el.querySelector('.stat-key')!.textContent === '已播幀數',
+        );
+        return Number(cell!.querySelector('.stat-val')!.textContent);
+      });
+      expect(framesShown, '離線之下 QR 播唔郁 —— worker 或者 wasm 冇快取到').toBeGreaterThan(5);
+
+      expect(pageErrors).toEqual([]);
     } finally {
       await browser.close();
     }

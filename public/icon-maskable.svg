@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    Maskable 圖示：作業系統會將佢裁成圓形／方角等唔同形狀，
+    所以圖案要收喺中間 80% 嘅安全區內（即係每邊留 51.2px 以上）。
+    呢度用 0.68 倍縮放再置中，留足夠餘地。
+  -->
+  <rect width="512" height="512" fill="#0b0d10"/>
+  <g transform="translate(82, 82) scale(0.68)">
+    <g fill="#ffb454">
+      <path d="M64 64h144v144H64V64zm32 32v80h80V96H96z"/>
+      <path d="M304 64h144v144H304V64zm32 32v80h80V96h-80z"/>
+      <path d="M64 304h144v144H64V304zm32 32v80h80v-80H96z"/>
+      <rect x="112" y="112" width="48" height="48"/>
+      <rect x="352" y="112" width="48" height="48"/>
+      <rect x="112" y="352" width="48" height="48"/>
+    </g>
+    <g fill="#6fd08c">
+      <rect x="256" y="256" width="48" height="48"/>
+      <rect x="352" y="256" width="48" height="48"/>
+      <rect x="304" y="304" width="48" height="48"/>
+      <rect x="400" y="304" width="48" height="48"/>
+      <rect x="256" y="352" width="48" height="48"/>
+      <rect x="352" y="352" width="48" height="48"/>
+      <rect x="304" y="400" width="48" height="48"/>
+      <rect x="400" y="400" width="48" height="48"/>
+    </g>
+  </g>
+</svg>

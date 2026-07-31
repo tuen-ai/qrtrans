@@ -1,6 +1,7 @@
 import './style.css';
 import { SenderView } from './ui/sender';
 import { ReceiverView } from './ui/receiver';
+import { setupInstall, registerServiceWorker } from './ui/install';
 
 /**
  * 入口：發送 / 接收兩個 tab 嘅切換。
@@ -50,3 +51,7 @@ window.addEventListener('pagehide', () => {
   sender.stop();
   receiver.stop();
 });
+
+// 裝落主畫面 + 離線能力
+setupInstall();
+registerServiceWorker();

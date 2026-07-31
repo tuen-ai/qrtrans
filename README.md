@@ -11,6 +11,8 @@
 
 雙向嘅：兩邊都可以做發送端或者接收端。
 
+**可以裝落主畫面**，裝咗之後連載入 app 都唔使上網 —— 真正嘅完全離線。
+
 ---
 
 ## 🔒 私隱
@@ -37,6 +39,9 @@ GitHub Pages 只係 host 程式碼（程式碼本身係公開嘅）。檔案內�
 npm test          # 私隱測試 + 真瀏覽器全程監聽網絡請求，斷言零外部請求
 ```
 
+Service worker 亦都受同一套約束：佢係整個 app 入面唯一可以攔截所有請求嘅嘢，
+所以係手寫嘅（唔用 Workbox），只有幾十行，而且有測試守住佢**只准同源 GET**。
+
 自己再確認一次：開 DevTools 的 Network 面板，全程傳一個檔案 —— 除咗最初載入 app 同 wasm，應該一個請求都冇。
 
 ---
@@ -46,6 +51,15 @@ npm test          # 私隱測試 + 真瀏覽器全程監聽網絡請求，斷言
 1. **電腦**開網頁 → 「發送」→ 揀檔案 → 開始播放
 2. **手機**開同一條網址 → 「接收」→ 開啟鏡頭 → 對正個閃緊嘅 QR
 3. 收齊自動驗 SHA-256，然後下載
+
+### 裝成 app
+
+- **Android / Chrome / Edge**：頁面上面會出「安裝」掣，撳一下就得
+- **iPhone / Safari**：分享 → 加入主畫面（iOS 冇安裝 API，只可以自己撳）
+- **桌面 Chrome / Edge**：網址列右邊嘅安裝圖示
+
+裝咗之後全部資源（連 1MB 嘅 QR 解碼 wasm）都會 precache 落機，
+飛行模式一樣開得到、用得到。
 
 ### 揀啱設定
 
@@ -132,12 +146,13 @@ src/
 ├─ codec/        File ↔ gzip ↔ SHA-256 ↔ manifest
 ├─ render/       qr-encode（編碼 + 檔位）、qr-painter、camera
 ├─ workers/      encode.worker（產包+編 QR）、decode.worker（zxing）
-└─ ui/           sender、receiver、stats
+├─ ui/           sender、receiver、stats、install（PWA 安裝提示）
+└─ sw.ts         service worker（precache 清單由 Vite 插件喺 build 時填入）
 ```
 
 ### 測試
 
-61 個測試，分五層：
+72 個測試，分六層：
 
 | 檔案 | 測乜 |
 |---|---|
@@ -145,8 +160,9 @@ src/
 | `lt.test.ts` | LT 端到端：掉包 0–50%、亂序到達、隨機模糊測試、overhead 迴歸門檻 |
 | `qr-roundtrip.test.ts` | 任意二進位 → QR → zxing → 一模一樣。滿載、全 0x00/0xFF、高位 byte、容量邊界、確認冇 ECI |
 | `loopback.test.ts` | 真 File → gzip → fountain → QR 圖 → zxing → LT → gunzip → SHA-256，喺 25/30/50% 掉幀率下 |
-| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋 |
-| `privacy.test.ts` | 私隱防線：唔准有外送 API、外部網域、CDN 殘留；CSP 內容 |
+| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋；**斷網之後重載 app 兼真係播到 QR** |
+| `privacy.test.ts` | 私隱防線：唔准有外送 API、外部網域、CDN 殘留；CSP 內容；service worker 只准同源 |
+| `pwa.test.ts` | manifest 欄位、圖示齊全、sw.js 檔名穩定、precache 涵蓋 worker 同 wasm、註冊碼真係喺產物入面 |
 
 ---
 
@@ -156,6 +172,7 @@ src/
 - 需要 HTTPS 先用得鏡頭
 - iPhone 請用 Safari。部分 app 內置瀏覽器（IG / FB / 微信）唔畀開鏡頭
 - 冇加密。air gap 本身已經幾私密，但如果想防旁人偷影，可以將檔案自己先加密再傳
+- 離線只係指「唔使網絡」——「發送」同「接收」始終要兩部機，一部播一部掃
 
 ## 靈感
 

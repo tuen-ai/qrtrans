@@ -102,6 +102,38 @@ body {
   color: var(--green);
 }
 
+/* ── 安裝提示 ───────────────────────────────────────── */
+
+.install-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 14px 0;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
+  border-radius: 8px;
+  color: var(--ink-dim);
+  font-size: 13px;
+}
+
+.install-bar span {
+  flex: 1 1 200px;
+}
+
+.install-bar .btn {
+  padding: 5px 14px;
+  font-size: 13px;
+}
+
+.btn.ghost {
+  padding: 5px 10px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-dim);
+}
+
 /* ── 面板 ───────────────────────────────────────────── */
 
 .panel {

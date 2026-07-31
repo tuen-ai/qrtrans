@@ -27,6 +27,10 @@ function read(path: string): string {
 
 describe('私隱防線', () => {
   it('原始碼入面冇任何外送資料嘅 API', () => {
+    // service worker 係唯一例外：佢嘅本職就係代理頁面自己嘅請求，
+    // 冇 fetch 就做唔到嘢。下面有一個專門測試守住佢只准同源。
+    const SW = join(SRC, 'sw.ts');
+
     // 逐個檢查所有可以將 bytes 送出去嘅途徑
     const forbidden: Array<[RegExp, string]> = [
       [/\bfetch\s*\(/, 'fetch()'],
@@ -43,10 +47,34 @@ describe('私隱防線', () => {
     for (const file of sourceFiles()) {
       const text = read(file);
       for (const [pattern, label] of forbidden) {
+        // sw.ts 淨係豁免 fetch()，其餘途徑照樣唔准
+        if (file === SW && label === 'fetch()') continue;
         if (pattern.test(text)) offences.push(`${relative(REPO, file)}：${label}`);
       }
     }
     expect(offences).toEqual([]);
+  });
+
+  it('service worker 只准同源，唔可以做外送通道', () => {
+    const sw = read(join(SRC, 'sw.ts'));
+
+    // 兩道閘：非 GET 唔理、跨域唔理。任何一道冇咗，SW 就可以變成
+    // 一條繞過 CSP 嘅出口（SW 入面嘅請求唔受頁面 CSP 管）
+    expect(sw).toMatch(/request\.method\s*!==\s*'GET'\s*\)\s*return/);
+    expect(sw).toMatch(/url\.origin\s*!==\s*sw\.location\.origin\s*\)\s*return/);
+
+    // 每一個 fetch 嘅目標都必須源自被攔截嘅 request 本身，
+    // 唔可以係任何寫死或者拼出嚟嘅 URL
+    const fetchCalls = sw.match(/\bfetch\s*\([^)]*\)/g) ?? [];
+    expect(fetchCalls.length).toBeGreaterThan(0);
+    for (const call of fetchCalls) {
+      expect(call, `可疑嘅 fetch 目標：${call}`).toMatch(/^fetch\(request\)$/);
+    }
+
+    // 唔准真係叫 skipWaiting()：頁面行到一半換版本兼清走舊 cache，
+    // 就會令仲未 load 嘅 worker ／ wasm（帶 hash 嘅檔名）404。
+    // 註釋度提到個名唔算，所以要 match 呼叫而唔係字串
+    expect(sw).not.toMatch(/\bskipWaiting\s*\(/);
   });
 
   it('冇引用任何外部網域（CDN、字型、分析）', () => {
@@ -95,7 +123,8 @@ describe('私隱防線', () => {
   it('build 產物入面冇殘留外部網域', () => {
     const dist = join(REPO, 'dist');
     const files = globSync(join(dist, '**/*.{js,html,css}'));
-    if (files.length === 0) return; // 未 build 就算數（browser.test.ts 會負責 build）
+    // globalSetup 已經 build 咗，所以冇檔案就係真係出咗事，唔可以靜靜跳過
+    expect(files.length).toBeGreaterThan(0);
 
     const offences: string[] = [];
     for (const file of files) {

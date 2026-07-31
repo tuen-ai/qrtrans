@@ -1,0 +1,54 @@
+{
+  "name": "QRTRANS — 閃爍 QR 離線檔案傳輸",
+  "short_name": "QRTRANS",
+  "description": "用快速閃爍嘅二維碼喺兩部裝置之間傳檔案。唔使網絡、唔使藍牙、唔使配對，檔案唔會離開你部裝置。",
+  "lang": "zh-Hant-HK",
+  "dir": "ltr",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "發送檔案",
+      "short_name": "發送",
+      "url": "./#send",
+      "icons": [{ "src": "./icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "接收檔案",
+      "short_name": "接收",
+      "url": "./#receive",
+      "icons": [{ "src": "./icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

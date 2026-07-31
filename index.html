@@ -29,6 +29,16 @@
          所以唔擺喺度。GitHub Pages 送唔到自訂 header，呢一項要靠部署層提供。 -->
 
     <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+
+    <!-- iOS 唔識 manifest 嘅 display / icons，要靠呢幾個 meta。
+         Safari 冇安裝提示，用戶要自己「分享 → 加入主畫面」。 -->
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="QRTRANS" />
+
     <title>QRTRANS — 閃爍 QR 離線檔案傳輸</title>
     <meta
       name="description"
@@ -52,6 +62,12 @@
         <strong>🔒 檔案唔會離開你部裝置。</strong>
         冇伺服器、冇上傳、冇任何網絡請求 —— 資料淨係經螢幕上嘅光同相機傳送。
       </p>
+
+      <div class="install-bar" id="install-bar" hidden>
+        <span id="install-text">裝落主畫面就可以完全離線用，唔使開瀏覽器。</span>
+        <button class="btn" id="install-btn" hidden>安裝</button>
+        <button class="btn ghost" id="install-dismiss" aria-label="收起">✕</button>
+      </div>
 
       <!-- ══════════════════════ 發送 ══════════════════════ -->
       <section class="view" id="view-send" role="tabpanel">
