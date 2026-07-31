@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+.vite/
+
+# 絕對唔好意外 commit 用戶測試緊嘅檔案
+/samples/
