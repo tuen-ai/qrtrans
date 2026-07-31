@@ -247,8 +247,11 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
       // canvas 邊長一定要係模組數嘅整數倍（v27 = 125 + 8 靜區 = 133）
       expect(canvasWidth % 133).toBe(0);
       expect(canvasWidth).toBeGreaterThan(300);
-      expect(Number(stats['實際 FPS'])).toBeGreaterThan(24);
-      expect(Number(stats['已播幀數'])).toBeGreaterThan(30);
+      // 門檻定得鬆過目標（30fps）：CI runner 冇 GPU 又要同其他 job 爭 CPU。
+      // 呢度想捉嘅係「管線塞死咗」，唔係量度真實效能 —— 真實幀率要喺
+      // 實機度睇。低過 15 就代表 worker 或者 rAF 迴圈出咗事
+      expect(Number(stats['實際 FPS'])).toBeGreaterThan(15);
+      expect(Number(stats['已播幀數'])).toBeGreaterThan(20);
 
       expect(pageErrors).toEqual([]);
       expect(consoleErrors).toEqual([]);

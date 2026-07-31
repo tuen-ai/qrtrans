@@ -34,15 +34,22 @@ jobs:
       - name: 裝 Chromium
         run: npx playwright install --with-deps chromium
 
-      # 測試包含私隱防線檢查（唔准有外送 API、唔准有外部網域、
-      # build 產物唔准有 CDN 主機），唔過就唔部署
-      - name: 跑測試
-        run: npm run test:ci
-
+      # 一定要喺測試之前 build：privacy.test.ts 其中一項係掃 dist/
+      # 有冇 CDN 主機殘留，冇 dist 嘅話嗰項會靜靜雞跳過
       - name: Build
         run: npm run build
 
+      # 包含私隱防線檢查（唔准有外送 API、外部網域、CDN 殘留），
+      # 唔過就唔部署
+      - name: 跑測試
+        run: npm run test:ci
+
+      # enablement: true 會順手幫個 repo 開埋 Pages（build_type=workflow），
+      # 唔使人手去 Settings 撳
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
