@@ -34,6 +34,7 @@ const STAT_KEYS = [
   'GOODPUT',
   'ELAPSED',
   'FRAMES NEW/DUP/RED',
+  '已解符號',
   'SESSION',
   'BLOCK LEN',
   'PAYLOAD',
@@ -86,6 +87,10 @@ export class ReceiverView {
   private ctx: CanvasRenderingContext2D | null = null;
 
   private roi: Region | null = null;
+  /** ROI 係按住幾多格 QR 定出嚟 —— 防止部分偵測令佢愈縮愈細 */
+  private roiCells = 0;
+  /** 一共解到幾多個 QR 符號（可以多過相機幀數，因為一幀有幾格） */
+  private symbolsDecoded = 0;
   private missStreak = 0;
   private dropped = 0;
   private startedAt = 0;
@@ -191,6 +196,7 @@ export class ReceiverView {
     this.pool = [];
     this.inflight.clear();
     this.roi = null;
+    this.roiCells = 0;
     this.roiBox.hidden = true;
   }
 
@@ -202,6 +208,7 @@ export class ReceiverView {
     this.foreignSessions.clear();
     this.dropped = 0;
     this.missStreak = 0;
+    this.symbolsDecoded = 0;
     this.requestId = 0;
     this.stats.reset();
     this.progressBar.style.width = '0%';
@@ -282,20 +289,32 @@ export class ReceiverView {
     this.inflight.delete(msg.id);
     if (!this.running) return;
 
-    if (!msg.bytes) {
+    if (msg.symbols.length === 0) {
       this.missStreak++;
       if (this.roi && this.missStreak >= ROI_UNLOCK_MISSES) {
         // 用戶郁咗部機／發送端郁咗，返去掃全畫面重新搵
         this.roi = null;
+        this.roiCells = 0;
         this.roiBox.hidden = true;
       }
       return;
     }
 
     this.missStreak = 0;
+    // 一個相機幀可以帶返幾個獨立嘅 fountain 包（發送端排住 grid）——
+    // decode fps 數嘅係相機幀，符號數另外計
     this.decodeMeter.tick(performance.now());
-    if (req && msg.box) this.updateRoi(req, msg.box);
-    this.handleFrame(msg.bytes);
+    this.symbolsDecoded += msg.symbols.length;
+
+    // ROI 只喺「見到至少同以往一樣多格」嗰陣先更新。
+    // 否則一個只解到一格嘅畫面就會令 ROI 縮到得嗰格咁細，
+    // 之後永遠掃唔返其餘幾格 —— 一個會自我鎖死嘅陷阱
+    if (req && msg.box && msg.symbols.length >= this.roiCells) {
+      this.roiCells = msg.symbols.length;
+      this.updateRoi(req, msg.box);
+    }
+
+    for (const bytes of msg.symbols) this.handleFrame(bytes);
     this.updateLiveStats();
   }
 
@@ -503,8 +522,15 @@ export class ReceiverView {
     const decode = this.decodeMeter.rate(now);
 
     this.stats.set('CAPTURE FPS', capture.toFixed(0));
-    this.stats.set('DECODE FPS', decode.toFixed(1), decode > 5 ? 'good' : 'hot');
+    // 一個相機幀可以帶返幾個符號（發送端排住 grid），所以除咗幀率之外
+    // 仲要顯示每幀解到幾多格 —— 嗰個先係真正嘅資料流入倍數
+    this.stats.set(
+      'DECODE FPS',
+      this.roiCells > 1 ? `${decode.toFixed(1)} × ${this.roiCells} 格` : decode.toFixed(1),
+      decode > 5 ? 'good' : 'hot',
+    );
     this.stats.set('LOCK', this.roi ? '鎖定' : '搜尋中', this.roi ? 'good' : 'plain');
+    this.stats.set('已解符號', String(this.symbolsDecoded));
     this.stats.set('DROPPED', String(this.dropped));
     this.stats.set('ELAPSED', formatDuration(now - this.startedAt));
 

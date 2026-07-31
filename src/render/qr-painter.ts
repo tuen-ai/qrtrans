@@ -36,9 +36,16 @@ export class QrPainter {
     return this.paddedSize;
   }
 
-  /** 收到新一幀矩陣，寫入離屏 buffer。 */
-  setMatrix(size: number, modules: Uint8Array): void {
-    const padded = size + QUIET_MODULES * 2;
+  /**
+   * 收到新一幀，寫入離屏 buffer。
+   *
+   * `modules` 入面順序放住 `grid × grid` 個獨立 QR（每個 `size × size`），
+   * 由左上到右下逐行排。每個碼都有自己嘅 4 模組靜區，所以兩個相鄰嘅碼
+   * 之間自然就有 8 個模組嘅白邊 —— 唔使額外留間隔，解碼器分得清。
+   */
+  setMatrix(size: number, modules: Uint8Array, grid = 1): void {
+    const cell = size + QUIET_MODULES * 2;
+    const padded = cell * grid;
     if (padded !== this.paddedSize || !this.imageData) {
       this.paddedSize = padded;
       this.offscreen.width = padded;
@@ -49,15 +56,23 @@ export class QrPainter {
     const data = this.imageData.data;
     data.fill(255); // 白底（連 alpha 一齊填成 255）
 
-    for (let my = 0; my < size; my++) {
-      const srcRow = my * size;
-      const dstRow = (my + QUIET_MODULES) * padded + QUIET_MODULES;
-      for (let mx = 0; mx < size; mx++) {
-        if (!modules[srcRow + mx]) continue;
-        const o = (dstRow + mx) * 4;
-        data[o] = 0;
-        data[o + 1] = 0;
-        data[o + 2] = 0;
+    const perCell = size * size;
+    for (let gy = 0; gy < grid; gy++) {
+      for (let gx = 0; gx < grid; gx++) {
+        const base = (gy * grid + gx) * perCell;
+        const originX = gx * cell + QUIET_MODULES;
+        const originY = gy * cell + QUIET_MODULES;
+        for (let my = 0; my < size; my++) {
+          const srcRow = base + my * size;
+          const dstRow = (originY + my) * padded + originX;
+          for (let mx = 0; mx < size; mx++) {
+            if (!modules[srcRow + mx]) continue;
+            const o = (dstRow + mx) * 4;
+            data[o] = 0;
+            data[o + 1] = 0;
+            data[o + 2] = 0;
+          }
+        }
       }
     }
 
@@ -66,20 +81,30 @@ export class QrPainter {
   }
 
   /**
-   * 調整顯示 canvas 大細。會將像素尺寸夾成模組數嘅整數倍 ——
-   * 咁樣每個模組都係一模一樣嘅正方形，冇 half-pixel 造成嘅灰邊，
-   * 相機二值化嗰陣乾淨好多。
+   * 調整顯示 canvas 大細。
+   *
+   * 整數倍縮放最靚 —— 每個模組都係一模一樣嘅正方形。但如果硬性要求
+   * 整數倍，喺可用空間得模組數 1.x 倍嗰陣就要向下取整到 1 倍，白白
+   * 嘥掉最多一半面積。多碼並排之後模組總數翻幾倍，好容易撞正呢個情況。
+   *
+   * 對相機嚟講，**QR 喺畫面上有幾大**比「模組闊度完全一致」重要得多：
+   * 前者直接決定相機每個模組收到幾多像素（實測低過 3 就完全解唔到），
+   * 後者只係令模組闊度喺 3 同 4 像素之間跳，解碼器嘅網格估算食得住。
+   *
+   * 所以：整數倍嘅損失喺 15% 以內就用整數倍，否則填滿可用空間。
+   * 兩種情況都熄咗 image smoothing，所以永遠唔會有灰邊。
    */
   resize(cssSize: number, dpr: number): void {
     if (this.paddedSize === 0) return;
     const wanted = Math.max(1, Math.floor(cssSize * dpr));
-    const scale = Math.max(1, Math.floor(wanted / this.paddedSize));
-    const pixels = scale * this.paddedSize;
+    const exact = wanted / this.paddedSize;
+    const integer = Math.floor(exact);
+
+    const pixels = integer >= 1 && integer / exact >= 0.85 ? integer * this.paddedSize : wanted;
     if (this.canvas.width !== pixels) {
       this.canvas.width = pixels;
       this.canvas.height = pixels;
     }
-    // CSS 尺寸維持整數倍嘅實際像素除以 dpr，避免瀏覽器再做一次縮放
     const css = pixels / dpr;
     this.canvas.style.width = `${css}px`;
     this.canvas.style.height = `${css}px`;

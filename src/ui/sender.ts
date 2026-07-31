@@ -1,10 +1,16 @@
 import { packFile, SOFT_SIZE_LIMIT } from '../codec/pack';
 import { manifestPeriod } from '../protocol/frame';
-import { PROFILES, DEFAULT_PROFILE, getProfile, type ProfileId } from '../render/qr-encode';
+import {
+  PROFILES,
+  DEFAULT_PROFILE,
+  getProfile,
+  type ProfileId,
+  type QrProfile,
+} from '../render/qr-encode';
 import { QrPainter } from '../render/qr-painter';
 import { ScreenWakeLock } from '../render/wake-lock';
 import { StatsPanel, RateMeter, formatBytes, formatRate, formatDuration } from './stats';
-import type { FromWorker, ToWorker } from '../workers/encode.worker';
+import type { FromWorker, StartMessage, ToWorker } from '../workers/encode.worker';
 
 /**
  * 發送端：揀檔案 → 打包 → 開 worker 產 QR → 逐幀閃。
@@ -23,10 +29,35 @@ const PREBUFFER = 8;
  * 所以平時一個就夠。開多個係為咗畀高幀率同將來多碼並排留餘裕，
  * 而且每個 worker 都要抄一份 payload，唔好無謂開。
  */
-function encodeWorkerCount(targetFps: number): number {
+function encodeWorkerCount(targetFps: number, grid: number): number {
   const cores = navigator.hardwareConcurrency || 4;
-  if (targetFps <= 30 || cores <= 2) return 1;
-  return 2;
+  if (cores <= 2) return 1;
+  // 每秒要編碼嘅 QR 數 = fps × grid²。實測最密嘅 v40 都係 2.3 ms/個，
+  // 所以大約 400 個/秒係一個 worker 嘅上限；留一半餘裕
+  const codesPerSecond = targetFps * grid * grid;
+  return codesPerSecond > 200 ? 2 : 1;
+}
+
+/**
+ * 一句話講呢個「密度 × 格數」組合實唔實際。
+ *
+ * 實測嘅硬底線：**每個模組要有 3 個相機像素**，跌到 2 就完全解唔到
+ * （唔係差啲，係 0%）。所以喺 1080p 鏡頭之下，可用嘅模組總數大約係
+ * `1080 × 0.9 / 3 ≈ 324`，而 `總模組 = (QR 邊長 + 8) × 格數`。
+ *
+ * 呢個約束令「最密嘅 QR」唔等於「最快」—— 實測 1080p：
+ *   極速 v40 單碼 153 KB/s ＜ 平衡 v27 2×2 **232 KB/s** ＞ 穩陣 v20 3×3 214 KB/s
+ */
+function gridAdvice(profile: QrProfile, grid: number): string {
+  const totalModules = (profile.size + 8) * grid;
+  const pxPerModule = (1080 * 0.9) / totalModules;
+  if (pxPerModule < 2.6) {
+    return `⚠ 1080p 鏡頭得 ${pxPerModule.toFixed(1)} px/模組 —— 實測低過 3 就解唔到。揀疏啲嘅密度或者少啲格。`;
+  }
+  if (pxPerModule < 3.4) {
+    return `1080p 鏡頭約 ${pxPerModule.toFixed(1)} px/模組 —— 啱啱夠，要拿穩部機。`;
+  }
+  return `1080p 鏡頭約 ${pxPerModule.toFixed(1)} px/模組，有餘裕。`;
 }
 
 const STAT_KEYS = [
@@ -47,7 +78,7 @@ const STAT_KEYS = [
 interface QueuedFrame {
   size: number;
   modules: Uint8Array;
-  isManifest: boolean;
+  grid: number;
   bytes: number;
   /** 邊個 worker 產嘅 —— 消耗咗要 ack 返畀佢 */
   source: Worker;
@@ -60,6 +91,8 @@ export class SenderView {
   private readonly fileInput: HTMLInputElement;
   private readonly profileSelect: HTMLSelectElement;
   private readonly profileHint: HTMLElement;
+  private readonly gridSelect: HTMLSelectElement;
+  private readonly gridHint: HTMLElement;
   private readonly fpsSelect: HTMLSelectElement;
   private readonly startBtn: HTMLButtonElement;
   private readonly stopBtn: HTMLButtonElement;
@@ -95,6 +128,8 @@ export class SenderView {
     this.fileInput = must(root, '#file-input');
     this.profileSelect = must(root, '#profile-select');
     this.profileHint = must(root, '#profile-hint');
+    this.gridSelect = must(root, '#grid-select');
+    this.gridHint = must(root, '#grid-hint');
     this.fpsSelect = must(root, '#fps-select');
     this.startBtn = must(root, '#send-start');
     this.stopBtn = must(root, '#send-stop');
@@ -109,6 +144,7 @@ export class SenderView {
     this.wireFilePicking();
 
     this.profileSelect.addEventListener('change', () => this.onProfileChange());
+    this.gridSelect.addEventListener('change', () => this.onProfileChange());
     this.fpsSelect.addEventListener('change', () => {
       this.targetFps = Number(this.fpsSelect.value);
       this.stats.set('目標 FPS', String(this.targetFps));
@@ -130,18 +166,29 @@ export class SenderView {
     // 手機螢幕細，QR 畫得細，v40 幾乎唔可能掃得到 —— 預設幫用戶降檔
     const isSmallScreen = Math.min(window.screen.width, window.screen.height) < 600;
     this.profileSelect.value = isSmallScreen ? 'safe' : DEFAULT_PROFILE;
-    if (isSmallScreen) this.fpsSelect.value = '20';
+    if (isSmallScreen) {
+      // 手機做發送端：螢幕細，多格會令每格細到解唔到
+      this.fpsSelect.value = '20';
+      this.gridSelect.value = '1';
+    }
     this.targetFps = Number(this.fpsSelect.value);
     this.onProfileChange();
   }
 
   private onProfileChange(): void {
-    this.profileHint.textContent = getProfile(this.selectedProfileId()).hint;
+    const profile = getProfile(this.selectedProfileId());
+    const grid = this.selectedGrid();
+    this.profileHint.textContent = profile.hint;
+    this.gridHint.textContent = gridAdvice(profile, grid);
     if (this.file) this.showFileSummary(this.file);
   }
 
   private selectedProfileId(): ProfileId {
     return this.profileSelect.value as ProfileId;
+  }
+
+  private selectedGrid(): number {
+    return Number(this.gridSelect.value) || 1;
   }
 
   private wireFilePicking(): void {
@@ -187,10 +234,11 @@ export class SenderView {
 
   private showFileSummary(file: File): void {
     const profile = getProfile(this.selectedProfileId());
+    const cells = this.selectedGrid() ** 2;
     // 未壓縮前嘅粗略估算，畀用戶有個心理準備
     const blocks = Math.ceil(file.size / profile.blockSize);
     const framesNeeded = blocks * 1.5; // 實測掉幀之下大約 1.5×K
-    const seconds = framesNeeded / this.targetFps;
+    const seconds = framesNeeded / (this.targetFps * cells);
     const title = must<HTMLElement>(this.dropZone, '.dropzone-title');
     const hint = must<HTMLElement>(this.dropZone, '.dropzone-hint');
     title.textContent = file.name;
@@ -240,7 +288,8 @@ export class SenderView {
     this.stats.set('SESSION', sessionId.toString(16).toUpperCase().padStart(4, '0'));
     this.stats.start();
 
-    const workerCount = encodeWorkerCount(this.targetFps);
+    const grid = this.selectedGrid();
+    const workerCount = encodeWorkerCount(this.targetFps, grid);
     for (let i = 0; i < workerCount; i++) {
       const worker = new Worker(new URL('../workers/encode.worker.ts', import.meta.url), {
         type: 'module',
@@ -248,7 +297,7 @@ export class SenderView {
       worker.onmessage = (e: MessageEvent<FromWorker>) => this.onWorkerMessage(worker, e.data);
       worker.onerror = (e) => this.failPlayback(e.message || 'worker 出錯');
 
-      const startMsg: ToWorker = {
+      const startMsg: StartMessage = {
         type: 'start',
         // 只有最後一個先可以 transfer —— 之前幾個要各自留一份
         payload: i === workerCount - 1 ? packed.payload : packed.payload.slice(),
@@ -258,6 +307,7 @@ export class SenderView {
         workerId: i,
         workerCount,
         prebuffer: Math.max(2, Math.ceil(PREBUFFER / workerCount)),
+        grid,
       };
       worker.postMessage(startMsg, [startMsg.payload.buffer]);
       this.workers.push(worker);
@@ -276,7 +326,7 @@ export class SenderView {
     this.queue.push({
       size: msg.size,
       modules: msg.modules,
-      isManifest: msg.isManifest,
+      grid: msg.grid,
       bytes: msg.bytes,
       source,
     });
@@ -297,7 +347,7 @@ export class SenderView {
     const frame = this.queue.shift();
     if (!frame) return; // worker 未追到，今個刷新維持上一幀
 
-    this.painter.setMatrix(frame.size, frame.modules);
+    this.painter.setMatrix(frame.size, frame.modules, frame.grid);
     // 第一幀到咗（或者用戶轉咗檔位令 QR 版本變）之後先至知道要點樣量尺寸
     if (this.sizedFor !== this.painter.modulesPerSide) this.applySize();
     this.painter.draw();
@@ -325,7 +375,11 @@ export class SenderView {
     const profile = getProfile(this.selectedProfileId());
     // 「理論吞吐」= 假設接收端一幀都唔漏嘅上限，用嚟同接收端實際 goodput 對比
     const dataFraction = 1 - 1 / manifestPeriod(this.blockCount);
-    this.stats.set('理論吞吐', formatRate(profile.blockSize * this.targetFps * dataFraction));
+    const cells = this.selectedGrid() ** 2;
+    this.stats.set(
+      '理論吞吐',
+      formatRate(profile.blockSize * this.targetFps * cells * dataFraction),
+    );
   }
 
   /**

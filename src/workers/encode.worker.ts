@@ -34,6 +34,8 @@ export interface StartMessage {
   workerCount: number;
   /** 呢個 worker 預先準備幾多幀 */
   prebuffer: number;
+  /** 一畫面排 grid × grid 個獨立 QR */
+  grid: number;
 }
 
 export type ToWorker = StartMessage | { type: 'ack' } | { type: 'stop' };
@@ -42,11 +44,14 @@ export interface FrameMessage {
   type: 'frame';
   /** 第幾幀（全 pool 共用同一個編號空間） */
   index: number;
+  /** 每個 QR 嘅模組邊長 */
   size: number;
+  /** grid × grid 個 QR 嘅模組，順序平鋪 */
   modules: Uint8Array;
-  /** 呢幀係 manifest 定係 data */
-  isManifest: boolean;
-  /** payload byte 數，用嚟計 goodput */
+  grid: number;
+  /** 呢幀入面有幾多格係 manifest（診斷用） */
+  manifestCells: number;
+  /** 呢幀一共載咗幾多 payload byte，用嚟計 goodput */
   bytes: number;
 }
 
@@ -66,33 +71,54 @@ function post(msg: FromWorker, transfer: Transferable[] = []): void {
   (self as unknown as Worker).postMessage(msg, transfer);
 }
 
-/** 產生下一幀嘅 QR，送返主線程。 */
+/**
+ * 產生下一「幀」（即係成個 grid × grid 嘅畫面），送返主線程。
+ *
+ * 一畫面入面每一格都係一個**完全獨立**嘅 fountain 包。接收端一次過解
+ * 晒佢哋，實測多符號解碼幾乎唔使額外時間 —— 即係四個碼一個價。
+ */
 function produceFrame(): void {
   if (!encoder || !config || !manifestFrame || !scratch) return;
   const profile = getProfile(config.profileId);
+  const grid = config.grid;
+  const cells = grid * grid;
 
-  // 每 period 幀插播一次 manifest，令接收端攞到檔名、MIME 同 SHA-256
-  const isManifest = frameIndex % period === 0;
-  let frameBytes: Uint8Array;
-  if (isManifest) {
-    frameBytes = manifestFrame;
-  } else {
-    // seed 直接用全域幀編號 —— 各 worker 嘅編號唔會撞，所以 seed 亦唔會撞
-    encoder.encodeSeed(frameIndex, scratch);
-    frameBytes = encodeDataFrame(config.sessionId, frameIndex, config.manifest, scratch);
+  // 每格用一個唔同嘅全域序號，所以 seed 空間仍然唔會撞
+  const firstSerial = frameIndex * cells;
+  const perCell = profile.size * profile.size;
+  const modules = new Uint8Array(perCell * cells);
+
+  let manifestCells = 0;
+  let payloadBytes = 0;
+
+  for (let cell = 0; cell < cells; cell++) {
+    const serial = firstSerial + cell;
+    // 每 period 個「格」插播一次 manifest，令接收端攞到檔名、MIME 同 SHA-256
+    const isManifest = serial % period === 0;
+    let frameBytes: Uint8Array;
+    if (isManifest) {
+      frameBytes = manifestFrame;
+      manifestCells++;
+    } else {
+      encoder.encodeSeed(serial, scratch);
+      frameBytes = encodeDataFrame(config.sessionId, serial, config.manifest, scratch);
+      payloadBytes += encoder.blockSize;
+    }
+    const matrix = encodeQrMatrix(frameBytes, profile);
+    modules.set(matrix.modules, cell * perCell);
   }
 
-  const matrix = encodeQrMatrix(frameBytes, profile);
   post(
     {
       type: 'frame',
       index: frameIndex,
-      size: matrix.size,
-      modules: matrix.modules,
-      isManifest,
-      bytes: isManifest ? 0 : encoder.blockSize,
+      size: profile.size,
+      modules,
+      grid,
+      manifestCells,
+      bytes: payloadBytes,
     },
-    [matrix.modules.buffer],
+    [modules.buffer],
   );
   // 跳去下一個屬於自己嘅編號
   frameIndex += config.workerCount;

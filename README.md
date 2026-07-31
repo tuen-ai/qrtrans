@@ -63,16 +63,25 @@ Service worker 亦都受同一套約束：佢係整個 app 入面唯一可以攔
 
 ### 揀啱設定
 
-| QR 密度 | 規格 | 每幀 | 幾時用 |
+**最密嘅 QR 唔係最快。** 因為真正嘅硬底線係「每個模組要有 3 個相機像素」
+（實測跌到 2 就係 0%，唔係差啲）。喺 1080p 鏡頭之下可用模組總數大約 324，
+所以碼細啲、排多幾個，總吞吐反而高。1080p 實測：
+
+| 組合 | 相機每模組 | 一次解到 | 單 worker 吞吐 |
 |---|---|---|---|
-| 極速 | v40-L（177×177） | 2953 B | 大螢幕、光線充足、鏡頭好 |
-| 平衡 | v27-L（125×125） | 1465 B | 一般手機掃電腦螢幕（預設） |
-| 穩陣 | v20-M（97×97） | 666 B | 光線差、手震、細螢幕 |
+| 極速 v40 單碼 | 5 px | 1/1 | 153 KB/s |
+| **平衡 v27 2×2** | 3 px | 4/4 | **232 KB/s** ← 預設 |
+| 穩陣 v20 3×3 | 3 px | 9/9 | 214 KB/s |
+| 平衡 v27 3×3 | 2 px | **0/9** | 0 |
+| 極速 v40 2×2 | 2 px | **0/4** | 0 |
+
+發送頁面會按你揀嘅組合計出 1080p 鏡頭大約有幾多 px/模組，唔夠就會警告。
 
 **幀率預設 30fps，而唔係 60fps。** LCD 有響應時間，連續幀會拖影 ——
 60fps 但掉一半幀，比 30fps 全收到更慢。收唔到就調低，唔好調高。
 
 其他貼士：螢幕亮度較高、熄咗自動亮度；維持成個 QR 連白邊都喺鏡頭畫面入面。
+兩邊都會自動申請 Wake Lock，唔使驚傳到一半熄屏。
 
 ---
 
@@ -98,9 +107,32 @@ Service worker 亦都受同一套約束：佢係整個 app 入面唯一可以攔
 Seed 就係一切：包入面只帶一個 4-byte seed，接收端用同一個 PRNG 推導返
 呢個包 XOR 咗邊幾個 block —— index 清單唔使傳。
 
+### 多碼並排
+
+一個畫面排 N×N 個**完全獨立**嘅 fountain 包，接收端一次過解晒。
+實測多符號解碼幾乎唔使額外時間（2×2 同 1×1 一樣快 24 vs 26 ms）——
+即係四個碼一個價。
+
+### 釘死 QR mask pattern
+
+規格要求編碼器試晒 8 個 mask、逐個計罰分再揀最好 —— v40 即係
+8 × 177² 次評估，佔咗編碼時間九成以上。任何 mask 都合法，而我哋嘅內容
+係 fountain XOR 出嚟嘅近似隨機資料，本身就唔會出現 mask 想避開嘅大片
+同色區。
+
+| 檔位 | 自動揀 mask | 釘死 | 倍數 |
+|---|---|---|---|
+| 極速 v40-L | 30.7 ms/幀（33 fps 上限） | 2.3 ms（433 fps） | 13.3× |
+| 平衡 v27-L | 14.2 ms（70 fps） | 1.0 ms（995 fps） | 14.1× |
+| 穩陣 v20-M | 7.2 ms（139 fps） | 0.4 ms（2883 fps） | 20.7× |
+
+代價量過：喺 3px/module + 模糊 + ±40 雜訊嘅邊緣條件下，8 個 mask 解碼率
+都喺 96–98%，自動揀係 98%。即係最多蝕 2 個百分點 —— 而嗰 2% 正正就係
+fountain code 免費吸收嘅嘢。
+
 ### 每個熱路徑都搬離主線程
 
-- **發送**：fountain 產包 + QR 編碼喺 worker，維持 8 幀緩衝。主線程每幀只做一次 `drawImage`
+- **發送**：fountain 產包 + QR 編碼喺 worker，維持 8 幀緩衝。主線程每幀只做一次 `drawImage`。可以開幾個 worker，各自負責 `frameIndex % workerCount === workerId` 嗰批 —— fountain 包獨立、次序無所謂，所以完全唔使協調
 - **接收**：2–4 個解碼 worker 輪流食幀；全部忙就**直接掉幀唔排隊**（排隊只會令延遲愈滾愈大）
 - **統計面板 250ms 節流** —— 每幀寫 DOM 會實測拖低 decode fps
 
@@ -116,7 +148,10 @@ Seed 就係一切：包入面只帶一個 4-byte seed，接收端用同一個 PR
 - **二進位行 byte mode + ISO_8859_1** —— 當文字 UTF-8 編碼會令容量打對折兼搞爛資料，而 ISO_8859_1 係 QR 預設字集，唔會多出 ECI header 蝕位
 - **讀 zxing 嘅 `.bytes` 而唔係 `.text`** —— 同上，`.text` 會做字集轉換
 - **每幀有 CRC-32** —— QR 有 Reed-Solomon，但仍然有機會「成功解碼但內容錯」。一個壞包餵入 peeling 解碼器會靜靜雞污染一連串 block
-- **manifest 每 12 幀插播一次** —— 接收端幾時舉起手機都即刻 lock 得到
+- **DATA 幀自述** —— 每幀都帶 blockCount 同 payloadSize，接收端第一個解到嘅幀就開始砌，唔使等 manifest。blockSize 由幀長度推導返，唔使佔位
+- **進度條數收到幾多幀，唔數解咗幾多 block** —— LT peeling 係後置爆發嘅，實測收到 75% 需要嘅幀先解出 1.9% block。用 block 數就會由頭到尾釘死喺 0% 再彈到 100%
+- **iOS 相機要 `frameRate: {exact}`** —— 用 `ideal` 佢會靜靜雞畀返 30fps 而且唔報錯
+- **rVFC 要 generation counter** —— 已排隊嘅 callback 會活過 `stop()` 並喺下一條 stream 復活，變成兩條 capture loop
 
 ---
 
@@ -152,7 +187,7 @@ src/
 
 ### 測試
 
-72 個測試，分六層：
+89 個測試：
 
 | 檔案 | 測乜 |
 |---|---|
@@ -160,7 +195,10 @@ src/
 | `lt.test.ts` | LT 端到端：掉包 0–50%、亂序到達、隨機模糊測試、overhead 迴歸門檻 |
 | `qr-roundtrip.test.ts` | 任意二進位 → QR → zxing → 一模一樣。滿載、全 0x00/0xFF、高位 byte、容量邊界、確認冇 ECI |
 | `loopback.test.ts` | 真 File → gzip → fountain → QR 圖 → zxing → LT → gunzip → SHA-256，喺 25/30/50% 掉幀率下 |
-| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋；**斷網之後重載 app 兼真係播到 QR** |
+| `browser.test.ts` | 真 Chromium：發送端幀率同零外部請求；**用假鏡頭（Y4M 影片）跑完整接收端**，連 `camera.ts`、ROI 鎖定、worker pool 都覆蓋；**2×2 多碼並排端到端**；**斷網之後重載 app 兼真係播到 QR** |
+| `progress.test.ts` | 證明進度條真係線性推進、單調不減、完成一定到 100% |
+| `camera.test.ts` | 用「故意唔理會 cancel」嘅假 video 測 rVFC 殭屍迴圈防護；相機約束階梯 |
+| `encode-perf.test.ts` | QR 編碼速度迴歸門檻（防止有人改返去自動揀 mask） |
 | `privacy.test.ts` | 私隱防線：唔准有外送 API、外部網域、CDN 殘留；CSP 內容；service worker 只准同源 |
 | `pwa.test.ts` | manifest 欄位、圖示齊全、sw.js 檔名穩定、precache 涵蓋 worker 同 wasm、註冊碼真係喺產物入面 |
 
@@ -174,9 +212,20 @@ src/
 - 冇加密。air gap 本身已經幾私密，但如果想防旁人偷影，可以將檔案自己先加密再傳
 - 離線只係指「唔使網絡」——「發送」同「接收」始終要兩部機，一部播一部掃
 
-## 靈感
+## 靈感同致謝
 
-參考 mrdoob 分享嘅 **DECIMEN — Fountain QR File Transfer**。
+概念參考 mrdoob 分享嘅 **DECIMEN — Fountain QR File Transfer**。
+
+後來對照咗
+[bashalarmistalt/decimen-optical-transfer](https://github.com/bashalarmistalt/decimen-optical-transfer)
+嘅實作，佢哋 README 列嘅「hard-won details」好有價值，其中幾項直接令呢個
+專案修正咗真問題：進度條要數收幀數、iOS 相機要 `exact` 幀率、rVFC 殭屍
+迴圈、Wake Lock、釘死 mask pattern、自述式表頭。
+
+有一項驗證後**唔適用**：佢哋為咗 `Math.log` 跨引擎差異手寫咗確定性 log。
+嗰個問題源自佢哋直接攞 Float64 CDF 同 float 比大細；我哋將 CDF 量化成
+uint32 桶，實測安全邊際到 1e-12 相對誤差（比引擎實際差異大 4 個數量級）。
+改為加黃金向量測試釘死分佈。
 
 ## 授權
 

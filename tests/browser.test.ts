@@ -90,11 +90,15 @@ function serveDist(): Promise<{ server: Server; base: string }> {
 
 // ── Y4M 影片生成 ────────────────────────────────────────
 
-/** 將一個 QR 模組矩陣畫成一幀 YUV420p（黑白，所以 U/V 恆定 128）。 */
-function qrToYuvFrame(size: number, modules: Uint8Array, side: number): Uint8Array {
+/**
+ * 將 grid × grid 個 QR 模組矩陣畫成一幀 YUV420p（黑白，U/V 恆定 128）。
+ * `matrices` 順序由左上到右下。
+ */
+function qrToYuvFrame(size: number, matrices: Uint8Array[], grid: number, side: number): Uint8Array {
   const quiet = 4;
-  const padded = size + quiet * 2;
-  const scale = Math.floor((side * 0.88) / padded);
+  const cell = size + quiet * 2;
+  const padded = cell * grid;
+  const scale = Math.floor((side * 0.92) / padded);
   const drawn = padded * scale;
   const origin = Math.floor((side - drawn) / 2);
 
@@ -111,21 +115,33 @@ function qrToYuvFrame(size: number, modules: Uint8Array, side: number): Uint8Arr
     out.fill(255, (origin + y) * side + origin, (origin + y) * side + origin + drawn);
   }
 
-  // 模組（黑）
-  for (let my = 0; my < size; my++) {
-    for (let mx = 0; mx < size; mx++) {
-      if (!modules[my * size + mx]) continue;
-      const px0 = origin + (mx + quiet) * scale;
-      const py0 = origin + (my + quiet) * scale;
-      for (let py = py0; py < py0 + scale; py++) {
-        out.fill(0, py * side + px0, py * side + px0 + scale);
+  // 逐格畫模組（黑）
+  for (let gy = 0; gy < grid; gy++) {
+    for (let gx = 0; gx < grid; gx++) {
+      const modules = matrices[gy * grid + gx]!;
+      const cellX = origin + gx * cell * scale;
+      const cellY = origin + gy * cell * scale;
+      for (let my = 0; my < size; my++) {
+        for (let mx = 0; mx < size; mx++) {
+          if (!modules[my * size + mx]) continue;
+          const px0 = cellX + (mx + quiet) * scale;
+          const py0 = cellY + (my + quiet) * scale;
+          for (let py = py0; py < py0 + scale; py++) {
+            out.fill(0, py * side + px0, py * side + px0 + scale);
+          }
+        }
       }
     }
   }
   return out;
 }
 
-async function buildQrVideo(path: string, payloadBytes: Uint8Array): Promise<{ sha256: string; fileName: string }> {
+async function buildQrVideo(
+  path: string,
+  payloadBytes: Uint8Array,
+  grid = 1,
+  videoSize = VIDEO_SIZE,
+): Promise<{ sha256: string; fileName: string; blockSize: number }> {
   const profile = PROFILES.safe;
   const fileName = 'fake-camera.bin';
   const file = new File([payloadBytes as unknown as BlobPart], fileName, {
@@ -138,25 +154,32 @@ async function buildQrVideo(path: string, payloadBytes: Uint8Array): Promise<{ s
   const manifestFrame = encodeManifestFrame(sessionId, packed.manifest);
   const scratch = new Uint8Array(packed.manifest.blockSize);
 
-  const header = Buffer.from(`YUV4MPEG2 W${VIDEO_SIZE} H${VIDEO_SIZE} F${VIDEO_FPS}:1 Ip A1:1 C420jpeg\n`);
+  const header = Buffer.from(`YUV4MPEG2 W${videoSize} H${videoSize} F${VIDEO_FPS}:1 Ip A1:1 C420jpeg\n`);
   const chunks: Buffer[] = [header];
 
   const period = manifestPeriod(packed.manifest.blockCount);
+  const cells = grid * grid;
+  let serial = 0;
   for (let i = 0; i < VIDEO_FRAMES; i++) {
-    const frameBytes =
-      i % period === 0
-        ? manifestFrame
-        : encodeDataFrame(sessionId, encoder.next(scratch), packed.manifest, scratch);
-    const { size, modules } = encodeQrMatrix(frameBytes, profile);
+    const matrices: Uint8Array[] = [];
+    for (let c = 0; c < cells; c++) {
+      const frameBytes =
+        serial % period === 0
+          ? manifestFrame
+          : (encoder.encodeSeed(serial, scratch),
+            encodeDataFrame(sessionId, serial, packed.manifest, scratch));
+      serial++;
+      matrices.push(encodeQrMatrix(frameBytes, profile).modules);
+    }
     chunks.push(Buffer.from('FRAME\n'));
-    chunks.push(Buffer.from(qrToYuvFrame(size, modules, VIDEO_SIZE)));
+    chunks.push(Buffer.from(qrToYuvFrame(profile.size, matrices, grid, videoSize)));
   }
 
   await writeFile(path, Buffer.concat(chunks));
 
   const digest = await crypto.subtle.digest('SHA-256', payloadBytes.slice().buffer as ArrayBuffer);
   const sha256 = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
-  return { sha256, fileName };
+  return { sha256, fileName, blockSize: packed.manifest.blockSize };
 }
 
 // ── 測試 ────────────────────────────────────────────────
@@ -213,6 +236,7 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
       });
 
       await page.selectOption('#profile-select', 'balanced');
+      await page.selectOption('#grid-select', '1');
       await page.selectOption('#fps-select', '30');
       await page.click('#send-start');
       await page.waitForSelector('#send-playing:not([hidden])', { timeout: 15_000 });
@@ -252,9 +276,11 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
 
       // 畫面真係喺度閃：12 個取樣至少要有 8 個唔同嘅幀
       expect(new Set(hashes).size).toBeGreaterThanOrEqual(8);
-      // canvas 邊長一定要係模組數嘅整數倍（v27 = 125 + 8 靜區 = 133）
-      expect(canvasWidth % 133).toBe(0);
+      // canvas 要真係量過尺寸（唔再係 300px 預設值），而且要盡量填滿
+      // 可用空間。單碼 v27 = 133 個模組，整數倍損失細，所以應該係
+      // 133 嘅倍數
       expect(canvasWidth).toBeGreaterThan(300);
+      expect(canvasWidth % 133).toBe(0);
       // 門檻定得鬆過目標（30fps）：CI runner 冇 GPU 又要同其他 job 爭 CPU。
       // 呢度想捉嘅係「管線塞死咗」，唔係量度真實效能 —— 真實幀率要喺
       // 實機度睇。低過 15 就代表 worker 或者 rAF 迴圈出咗事
@@ -362,6 +388,62 @@ describe.skipIf(!chromiumPath)('真瀏覽器', () => {
       await browser.close();
     }
   }, 180_000);
+
+  it('接收端：2×2 多碼並排 —— 一個相機幀一次收 4 個獨立 fountain 包', async () => {
+    // 多碼並排嘅整個賣點：實測多符號解碼幾乎唔使額外時間（2×2 同 1×1
+    // 一樣快），所以四個碼一個價。呢個測試證明成條路真係通 ——
+    // 發送端排格、接收端一次解晒、ROI 框住成個 grid 而唔係其中一格。
+    const videoPath = join(workDir, 'grid.y4m');
+    const rng = new Prng(0x9001);
+    const payload = new Uint8Array(14_000);
+    for (let i = 0; i < payload.length; i++) payload[i] = rng.nextInt(256);
+    // 影片要夠大先夠 4 格各自有 3px/module（v20 = 105 模組 × 2 = 210）
+    const { sha256, fileName } = await buildQrVideo(videoPath, payload, 2, 960);
+
+    const browser = await chromium.launch({
+      executablePath: chromiumPath,
+      args: [
+        '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
+        `--use-file-for-fake-video-capture=${videoPath}`,
+      ],
+    });
+    try {
+      const context = await browser.newContext({ permissions: ['camera'] });
+      const page = await context.newPage();
+      const pageErrors: string[] = [];
+      page.on('pageerror', (e) => pageErrors.push(String(e)));
+
+      await page.goto(`${base}#receive`, { waitUntil: 'networkidle' });
+      await page.click('#recv-start');
+      await page.waitForSelector('#recv-scanning:not([hidden])', { timeout: 20_000 });
+      await page.waitForSelector('#recv-done:not([hidden])', { timeout: 120_000 });
+
+      const banner = (await page.textContent('#recv-banner'))!;
+      const meta = (await page.textContent('#recv-meta'))!;
+      const stats = await page.evaluate(() =>
+        Object.fromEntries(
+          [...document.querySelectorAll('#recv-stats .stat')].map((el) => [
+            el.querySelector('.stat-key')!.textContent,
+            el.querySelector('.stat-val')!.textContent,
+          ]),
+        ),
+      );
+
+      expect(pageErrors).toEqual([]);
+      expect(banner).toContain('傳輸完成');
+      expect(banner).not.toContain('對唔上');
+      expect(meta).toContain(sha256);
+      expect(meta).toContain(fileName);
+
+      // 關鍵斷言：DECODE FPS 顯示「× N 格」，即係真係一幀解到多過一個符號
+      expect(stats['DECODE FPS'], `冇一次過解到多格：${stats['DECODE FPS']}`).toContain('格');
+      // 解到嘅符號總數要遠多過相機幀數
+      expect(Number(stats['已解符號'])).toBeGreaterThan(20);
+    } finally {
+      await browser.close();
+    }
+  }, 240_000);
 
   it('接收端：用假鏡頭餵一條 QR 影片，完整還原並驗到 SHA-256', async () => {
     const videoPath = join(workDir, 'qr.y4m');
