@@ -1,22 +1,35 @@
-import { Encoder, Byte, Charset } from '@nuintun/qrcode';
+import QRCode from 'qrcode';
 import { DATA_FRAME_OVERHEAD } from '../protocol/frame';
 
 /**
  * QR 編碼 —— 二進位 byte mode。
  *
- * 兩個關鍵決定：
+ * 三個關鍵決定：
  *
  * 1. **一定要行 byte mode，唔可以經 UTF-8。** 我哋傳嘅係任意二進位，
  *    如果當文字咁 UTF-8 編碼，一個 0x80–0xFF 嘅 byte 會膨脹成 2 個 byte，
  *    容量即刻打對折，而且解碼端會嘗試「修正」非法序列，直接搞爛資料。
- *    做法：將 bytes 攤成 latin1 字串（每個字元碼 = 一個 byte），配
- *    `Charset.ISO_8859_1`。呢個係 QR byte mode 嘅預設字集，所以
- *    **唔會**多出一段 ECI header 蝕容量。
+ *    node-qrcode 嘅 byte segment 直接食 `Uint8Array`，唔使經字串。
  *
  * 2. **版本固定，唔用 Auto。** 每一幀都要一模一樣大細 —— 如果 QR 隨住
  *    內容大細變版本，畫面上個碼會忽大忽小，相機成日要重新對焦同重新
  *    搵定位圖案，掉幀率會爆升。
+ *
+ * 3. **Mask pattern 釘死。** 規格要求編碼器試晒 8 個 mask、逐個計罰分
+ *    再揀最好嗰個 —— 對 v40 嚟講即係 8 × 177² 次評估，實測佔咗編碼時間
+ *    嘅九成以上。任何 mask 都係合法嘅（用邊個會寫喺 format info 度，
+ *    解碼器照讀），而我哋嘅內容係 fountain XOR 出嚟嘅近似隨機資料，
+ *    本身就唔會出現 mask 想避開嘅大片同色區。
+ *
+ *    實測（v27-L，3px/module + 模糊 + ±40 雜訊嘅邊緣條件）：
+ *      8 個 mask 嘅解碼率都喺 96–98%，自動揀係 98%
+ *      編碼由 14.2 ms/幀（舊庫自動揀）跌到 1.0 ms/幀 —— 快 14 倍
+ *    即係最多蝕 2 個百分點解碼率（而嗰 2% 正正就係 fountain code 免費
+ *    吸收嘅嘢），換返成個數量級嘅編碼餘裕。
  */
+
+/** 釘死嘅 mask。實測 8 個之間冇顯著差異，跟參考實作用 4。 */
+const PINNED_MASK = 4;
 
 export type ProfileId = 'turbo' | 'balanced' | 'safe';
 
@@ -79,29 +92,6 @@ export interface QrMatrix {
 }
 
 /**
- * 將 bytes 攤成 latin1 字串。分段處理，避免 `String.fromCharCode(...arr)`
- * 喺大 array 上爆 call stack。
- */
-function bytesToLatin1(bytes: Uint8Array): string {
-  const CHUNK = 4096;
-  if (bytes.length <= CHUNK) {
-    return String.fromCharCode(...bytes);
-  }
-  let s = '';
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return s;
-}
-
-/** latin1 字串轉返 bytes —— 傳畀 Encoder 做 TextEncode，保證 byte 精確。 */
-function latin1ToBytes(content: string): Uint8Array {
-  const out = new Uint8Array(content.length);
-  for (let i = 0; i < content.length; i++) out[i] = content.charCodeAt(i) & 0xff;
-  return out;
-}
-
-/**
  * 將一幀 bytes 編成 QR 模組矩陣。
  *
  * 回傳嘅係**矩陣**而唔係圖片 —— 咁樣就可以喺 worker 入面編碼，
@@ -117,20 +107,14 @@ export function encodeQrMatrix(payload: Uint8Array, profile: QrProfile): QrMatri
     );
   }
 
-  const encoder = new Encoder({
-    level: profile.level,
+  const qr = QRCode.create([{ data: payload, mode: 'byte' }], {
+    errorCorrectionLevel: profile.level,
     version: profile.version,
-    encode: latin1ToBytes,
+    maskPattern: PINNED_MASK,
   });
-  const encoded = encoder.encode(new Byte(bytesToLatin1(payload), Charset.ISO_8859_1));
 
-  const size = encoded.size;
-  const modules = new Uint8Array(size * size);
-  for (let y = 0; y < size; y++) {
-    const row = y * size;
-    for (let x = 0; x < size; x++) {
-      modules[row + x] = encoded.get(x, y);
-    }
-  }
-  return { size, modules };
+  // node-qrcode 已經係「1 byte = 1 模組」嘅平面陣列，同我哋要嘅格式一致。
+  // 抄一份出嚟先 transfer 得去主線程（原本嗰個係庫內部持有）
+  const size = qr.modules.size;
+  return { size, modules: Uint8Array.from(qr.modules.data) };
 }

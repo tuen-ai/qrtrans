@@ -34,24 +34,33 @@ export class LtEncoder {
   }
 
   /**
-   * 產生下一個包，直接寫入 `out`（長度必須 = blockSize），回傳呢個包嘅 seed。
-   *
-   * 接收端只需要呢個 seed + manifest 入面嘅 K，就可以自行推導出包覆蓋咗
-   * 邊幾個 block —— 所以 index 清單唔使傳。
+   * 產生下一個包（用內部遞增 counter 做 seed），回傳嗰個 seed。
    */
   next(out: Uint8Array): number {
+    const seed = this.seed;
+    this.seed = (this.seed + 1) >>> 0;
+    this.encodeSeed(seed, out);
+    return seed;
+  }
+
+  /**
+   * 產生**指定 seed** 嘅包，直接寫入 `out`（長度必須 = blockSize）。
+   *
+   * 有咗呢個明確版本，就可以將 seed 空間切開畀幾個 worker 各自產包 ——
+   * fountain 包本身完全獨立、次序都唔重要，所以唔使任何協調。
+   *
+   * 接收端只需要 seed + blockCount，就可以自行推導出包覆蓋咗邊幾個
+   * block —— 所以 index 清單唔使傳。
+   */
+  encodeSeed(seed: number, out: Uint8Array): void {
     if (out.length !== this.blockSize) {
       throw new RangeError(`out 長度要係 ${this.blockSize}，收到 ${out.length}`);
     }
-    const seed = this.seed;
-    this.seed = (this.seed + 1) >>> 0;
-
     const indices = deriveIndices(this.soliton, seed);
     out.fill(0);
     for (const idx of indices) {
       const off = idx * this.blockSize;
       xorInto(out, this.data.subarray(off, off + this.blockSize));
     }
-    return seed;
   }
 }

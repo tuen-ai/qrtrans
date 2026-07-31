@@ -10,12 +10,16 @@ import { encodeQrMatrix, getProfile, type ProfileId } from '../render/qr-encode'
 /**
  * 發送端 worker：不停產生 fountain 包 → 編成 QR 模組矩陣 → 送返主線程。
  *
- * 點解要放喺 worker：v40 QR 每幀要行一次 Reed-Solomon 同 8 個 mask 嘅
- * 評分，係幾毫秒級嘅工作。放喺主線程做就一定 jank，QR 閃到唔穩定，
- * 相機一掃就掉幀。主線程淨係應該做一件事：`drawImage`。
+ * 點解要放喺 worker：QR 編碼加 Reed-Solomon 每幀都要一至幾毫秒。放喺
+ * 主線程做就一定 jank，QR 閃到唔穩定，相機一掃就掉幀。主線程淨係應該
+ * 做一件事：`drawImage`。
  *
- * 流量控制用 credit：主線程每消耗一幀就 `ack` 一次，worker 先再產多一幀。
- * 咁樣 queue 永遠維持喺 PREBUFFER 左右，唔會愈積愈多食爆記憶體。
+ * **可以開幾個。** 每個 worker 只負責 `frameIndex % workerCount === workerId`
+ * 嗰批幀，各自數自己嗰條。因為 fountain 包完全獨立、次序亦都無所謂，
+ * 所以幾個 worker 之間唔使任何協調 —— 冇鎖、冇共享狀態、冇排序。
+ *
+ * 流量控制用 credit：主線程每消耗一幀就向**產生嗰個 worker** ack 一次，
+ * 佢先再產多一幀。咁樣 queue 唔會愈積愈多食爆記憶體。
  */
 
 export interface StartMessage {
@@ -24,7 +28,11 @@ export interface StartMessage {
   manifest: Manifest;
   profileId: ProfileId;
   sessionId: number;
-  /** 預先準備幾多幀 */
+  /** 呢個 worker 喺 pool 入面排第幾（0-based） */
+  workerId: number;
+  /** pool 一共幾多個 worker */
+  workerCount: number;
+  /** 呢個 worker 預先準備幾多幀 */
   prebuffer: number;
 }
 
@@ -32,7 +40,7 @@ export type ToWorker = StartMessage | { type: 'ack' } | { type: 'stop' };
 
 export interface FrameMessage {
   type: 'frame';
-  /** 第幾幀（由開始播計起） */
+  /** 第幾幀（全 pool 共用同一個編號空間） */
   index: number;
   size: number;
   modules: Uint8Array;
@@ -48,6 +56,8 @@ let encoder: LtEncoder | null = null;
 let manifestFrame: Uint8Array | null = null;
 let scratch: Uint8Array | null = null;
 let config: StartMessage | null = null;
+let period = 12;
+/** 呢個 worker 下一個要產嘅全域幀編號 */
 let frameIndex = 0;
 let credits = 0;
 let pumping = false;
@@ -60,17 +70,16 @@ function post(msg: FromWorker, transfer: Transferable[] = []): void {
 function produceFrame(): void {
   if (!encoder || !config || !manifestFrame || !scratch) return;
   const profile = getProfile(config.profileId);
-  const period = manifestPeriod(config.manifest.blockCount);
 
-  // 每 manifestPeriod 幀插播一次 manifest，令接收端隨時舉起手機都 lock 得到
+  // 每 period 幀插播一次 manifest，令接收端攞到檔名、MIME 同 SHA-256
   const isManifest = frameIndex % period === 0;
   let frameBytes: Uint8Array;
   if (isManifest) {
     frameBytes = manifestFrame;
   } else {
-    const seed = encoder.next(scratch);
-    // 每個 DATA 幀都自述 blockCount / payloadSize，令接收端第一幀就開始砌
-    frameBytes = encodeDataFrame(config.sessionId, seed, config.manifest, scratch);
+    // seed 直接用全域幀編號 —— 各 worker 嘅編號唔會撞，所以 seed 亦唔會撞
+    encoder.encodeSeed(frameIndex, scratch);
+    frameBytes = encodeDataFrame(config.sessionId, frameIndex, config.manifest, scratch);
   }
 
   const matrix = encodeQrMatrix(frameBytes, profile);
@@ -85,7 +94,8 @@ function produceFrame(): void {
     },
     [matrix.modules.buffer],
   );
-  frameIndex++;
+  // 跳去下一個屬於自己嘅編號
+  frameIndex += config.workerCount;
 }
 
 /**
@@ -129,7 +139,8 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
           `manifest 幀 ${manifestFrame.length} bytes 塞唔落 ${profile.label}（${profile.capacity} bytes）—— 檔名太長？`,
         );
       }
-      frameIndex = 0;
+      period = manifestPeriod(msg.manifest.blockCount);
+      frameIndex = msg.workerId;
       credits = msg.prebuffer;
       pump();
     } catch (err) {

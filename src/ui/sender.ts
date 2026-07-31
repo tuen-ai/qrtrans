@@ -16,6 +16,19 @@ import type { FromWorker, ToWorker } from '../workers/encode.worker';
 /** 預先準備幾多幀。太少會斷流，太多食記憶體又令 stop 反應慢。 */
 const PREBUFFER = 8;
 
+/**
+ * 開幾多個編碼 worker。
+ *
+ * 釘死 mask 之後單核已經好夠（v40 實測 2.3 ms/幀 = 433 fps 上限），
+ * 所以平時一個就夠。開多個係為咗畀高幀率同將來多碼並排留餘裕，
+ * 而且每個 worker 都要抄一份 payload，唔好無謂開。
+ */
+function encodeWorkerCount(targetFps: number): number {
+  const cores = navigator.hardwareConcurrency || 4;
+  if (targetFps <= 30 || cores <= 2) return 1;
+  return 2;
+}
+
 const STAT_KEYS = [
   '檔案',
   '原始大細',
@@ -36,6 +49,8 @@ interface QueuedFrame {
   modules: Uint8Array;
   isManifest: boolean;
   bytes: number;
+  /** 邊個 worker 產嘅 —— 消耗咗要 ack 返畀佢 */
+  source: Worker;
 }
 
 export class SenderView {
@@ -55,7 +70,7 @@ export class SenderView {
   private readonly stats: StatsPanel;
 
   private file: File | null = null;
-  private worker: Worker | null = null;
+  private workers: Worker[] = [];
   private queue: QueuedFrame[] = [];
   private rafId: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
@@ -225,29 +240,35 @@ export class SenderView {
     this.stats.set('SESSION', sessionId.toString(16).toUpperCase().padStart(4, '0'));
     this.stats.start();
 
-    this.worker = new Worker(new URL('../workers/encode.worker.ts', import.meta.url), {
-      type: 'module',
-    });
-    this.worker.onmessage = (e: MessageEvent<FromWorker>) => this.onWorkerMessage(e.data);
-    this.worker.onerror = (e) => this.failPlayback(e.message || 'worker 出錯');
+    const workerCount = encodeWorkerCount(this.targetFps);
+    for (let i = 0; i < workerCount; i++) {
+      const worker = new Worker(new URL('../workers/encode.worker.ts', import.meta.url), {
+        type: 'module',
+      });
+      worker.onmessage = (e: MessageEvent<FromWorker>) => this.onWorkerMessage(worker, e.data);
+      worker.onerror = (e) => this.failPlayback(e.message || 'worker 出錯');
 
-    const startMsg: ToWorker = {
-      type: 'start',
-      payload: packed.payload,
-      manifest: packed.manifest,
-      profileId: profile.id,
-      sessionId,
-      prebuffer: PREBUFFER,
-    };
-    // payload 直接 transfer 過去，唔使複製（之後主線程用唔著佢）
-    this.worker.postMessage(startMsg, [packed.payload.buffer]);
+      const startMsg: ToWorker = {
+        type: 'start',
+        // 只有最後一個先可以 transfer —— 之前幾個要各自留一份
+        payload: i === workerCount - 1 ? packed.payload : packed.payload.slice(),
+        manifest: packed.manifest,
+        profileId: profile.id,
+        sessionId,
+        workerId: i,
+        workerCount,
+        prebuffer: Math.max(2, Math.ceil(PREBUFFER / workerCount)),
+      };
+      worker.postMessage(startMsg, [startMsg.payload.buffer]);
+      this.workers.push(worker);
+    }
 
     void this.wakeLock.request();
     this.observeResize();
     this.rafId = requestAnimationFrame((t) => this.tick(t));
   }
 
-  private onWorkerMessage(msg: FromWorker): void {
+  private onWorkerMessage(source: Worker, msg: FromWorker): void {
     if (msg.type === 'error') {
       this.failPlayback(msg.message);
       return;
@@ -257,6 +278,7 @@ export class SenderView {
       modules: msg.modules,
       isManifest: msg.isManifest,
       bytes: msg.bytes,
+      source,
     });
   }
 
@@ -279,7 +301,8 @@ export class SenderView {
     // 第一幀到咗（或者用戶轉咗檔位令 QR 版本變）之後先至知道要點樣量尺寸
     if (this.sizedFor !== this.painter.modulesPerSide) this.applySize();
     this.painter.draw();
-    this.worker?.postMessage({ type: 'ack' } satisfies ToWorker);
+    // ack 返畀產生呢一幀嗰個 worker，佢先會再產多一幀
+    frame.source.postMessage({ type: 'ack' } satisfies ToWorker);
 
     this.lastFrameAt = now;
     this.framesShown++;
@@ -293,7 +316,11 @@ export class SenderView {
     this.stats.set('實際 FPS', fps.toFixed(1), fps >= this.targetFps * 0.9 ? 'good' : 'hot');
     this.stats.set('已播幀數', String(this.framesShown));
     this.stats.set('ELAPSED', formatDuration(elapsed));
-    this.stats.set('緩衝', `${this.queue.length} / ${PREBUFFER}`, this.queue.length === 0 ? 'hot' : 'plain');
+    this.stats.set(
+      '緩衝',
+      `${this.queue.length} / ${PREBUFFER}${this.workers.length > 1 ? ` (${this.workers.length}w)` : ''}`,
+      this.queue.length === 0 ? 'hot' : 'plain',
+    );
 
     const profile = getProfile(this.selectedProfileId());
     // 「理論吞吐」= 假設接收端一幀都唔漏嘅上限，用嚟同接收端實際 goodput 對比
@@ -356,9 +383,11 @@ export class SenderView {
     window.removeEventListener('resize', this.applySize);
     this.sizedFor = 0;
 
-    this.worker?.postMessage({ type: 'stop' } satisfies ToWorker);
-    this.worker?.terminate();
-    this.worker = null;
+    for (const worker of this.workers) {
+      worker.postMessage({ type: 'stop' } satisfies ToWorker);
+      worker.terminate();
+    }
+    this.workers = [];
     this.queue = [];
 
     this.stats.stop();
